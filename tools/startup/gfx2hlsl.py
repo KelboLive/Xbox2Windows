@@ -1320,6 +1320,51 @@ class Stage:
         return sources
 
     def compare(self, base, ops, mods=()):
+        # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
+        # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
+        if base in ('v_cmp_class_f32', 'v_cmpx_class_f32', 'v_cmp_class_f16', 'v_cmpx_class_f16'):
+            f16 = base.endswith('_f16')
+            if len(ops) == 3:
+                dst, value, mask = ops
+            elif base.startswith('v_cmpx_') and len(ops) == 2:
+                # The _e32 spelling writes EXEC implicitly and prints no destination.
+                dst, (value, mask) = 'exec', ops
+            else:
+                raise Unsupported('%s with %d operands' % (base, len(ops)))
+            if f16:
+                # The helper classifies the raw binary16 bits in the low half of the word, so the value is
+                # read as an integer and an abs/neg modifier flips bit 15 (not 31). A float-printed
+                # operand would be lowered as its binary32 bits, so it is refused instead.
+                operand = value
+                if operand.startswith('-') and not re.match(r'-[\d.]', operand):
+                    operand = operand[1:]
+                elif operand.startswith('|') and operand.endswith('|'):
+                    operand = operand[1:-1]
+                if operand in FLOATS or re.fullmatch(r'-?\d+\.\d+', operand):
+                    raise Unsupported('binary16 class operand %s' % value)
+                bits = self.u(operand)
+                if value.startswith('-') and not re.match(r'-[\d.]', value):
+                    bits = '(%s ^ 0x8000u)' % bits
+                elif value.startswith('|') and value.endswith('|'):
+                    bits = '(%s & 0x7fffu)' % bits
+                cond = '(class16(%s) & %s) != 0u' % (bits, self.u(mask))
+            else:
+                cond = '(class32(%s) & %s) != 0u' % (self.f(value), self.u(mask))
+            predicate = '((%s) ? 1u : 0u)' % cond
+            # A narrowed EXEC must stay narrowed: intersect with it, as the generic compare path does.
+            if not self.exec_known:
+                predicate = '(exec & %s)' % predicate
+            if base.startswith('v_cmpx_') or dst in ('exec', 'exec_lo'):
+                self.exec_known = False
+                self.emit('exec = %s;' % predicate)
+            elif dst in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % predicate)
+            else:
+                d = reg_range(dst)[1]
+                self.set_s(d, predicate)
+                self.masks.add(d)
+            return None
+
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
@@ -1662,8 +1707,8 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
-               # The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
-               # shift and an in-place destination keeps the original value (the caller passes both words in).
+               // The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
+               // shift and an in-place destination keeps the original value (the caller passes both words in).
                'uint2 shl64(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (lo >> sc);'
                ' return uint2(sh < 32u ? (lo << sb) : 0u, sh < 32u ? ((hi << sb) | cy) : (lo << sb)); }',
@@ -1673,6 +1718,23 @@ class Pipeline:
                'uint2 shr64i(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
                ' uint cy = sb == 0u ? 0u : (hi << sc); uint h = asuint(asint(hi) >> sb);'
                ' return uint2(sh < 32u ? ((lo >> sb) | cy) : h, sh < 32u ? h : asuint(asint(hi) >> 31u)); }',
+               // The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
+               'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
+               ' bool negative = bits >= 0x80000000u;'
+               ' if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;'
+               ' if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;'
+               ' if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;'
+               ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
+               ' return negative ? 0x20u : 0x40u; }',
+               // The ten binary16 classes for v_cmp_class_f16, from bits [15:0] of the operand word
+               // (ported from tools/pixel_aot.py): sNaN qNaN -inf -normal -subnormal -0 +0 +subnormal +normal +inf.
+               'uint class16(uint bits) { uint h = bits & 0xffffu, magnitude = h & 0x7fffu;'
+               ' bool negative = h >= 0x8000u;'
+               ' if (magnitude > 0x7c00u) return (h & 0x0200u) != 0u ? 0x2u : 0x1u;'
+               ' if (magnitude == 0x7c00u) return negative ? 0x4u : 0x200u;'
+               ' if (magnitude >= 0x0400u) return negative ? 0x8u : 0x100u;'
+               ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
+               ' return negative ? 0x20u : 0x40u; }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]

@@ -6034,6 +6034,7 @@ translations that read the whole dword or zero-extend the byte must fail the dra
 and match their own plain-integer image. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vopc_sdwa' -V`.
 `tests/startup_gfx2hlsl_vopc_sdwa_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip every accepted
 form through LLVM 15.
+
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
 form, so a load of this format was refused with `buffer format BUF_FMT_16_16_16_16_FLOAT` - 5 of the 29
@@ -6053,6 +6054,22 @@ high words by value, mask the count to six bits, and return the two result words
 the handler writes back in one statement. VGPR pairs, SGPR pairs and the integer inline constants are
 sources; the low word is always shifted unsigned and only the arithmetic form signs the high word.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_b64_shift$' -V`.
+
+**The binary32 class comparison.** `v_cmp_class_f32` and `v_cmpx_class_f32` had no lowering, so both census
+forms were refused - 2 of the remaining refused shaders in the first main-game loading-screen cache (#870,
+issue #1797). They now lower to a ten-class helper carried in the shader preamble (ported from
+`tools/pixel_aot.py`), testing `class32(value) & mask`: the class bits are, in encoding order, signaling NaN,
+quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal and +inf. The mask is read as an integer
+operand (the census form uses the inline `-1`, i.e. every class) and the value as a float; the `_e32` and
+`_e64` spellings share the path, and the `v_cmpx_` form writes EXEC and clears the straight-line assumption.
+Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class$' -V`.
+
+**The binary16 class comparison.** `v_cmp_class_f16` and `v_cmpx_class_f16` share the class-compare
+branch with the binary32 form but read the value as raw binary16 bits in the low half of the operand word:
+`class16(bits) & mask`, with the ten class bits of the half format and the quiet bit at 0x0200. The census
+form `v_cmp_class_f16_e64 s14, 0x7c01, v0` now lowers. An `abs`/`neg` modifier on the value acts on bit 15
+of the half, not bit 31, and a float-printed operand is refused because it would be lowered as its
+binary32 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class_f16$' -V`.
 
 ## Pixel color without a texture sample
 
