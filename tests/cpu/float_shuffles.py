@@ -62,13 +62,10 @@ def check(native_path, lifted_path):
     assert "__m128i xmm0" in source and "xmm0 = mem;" in source, source
     assert source.count("load_always<__m128i>(") == 1, source
 
+    # Legacy MOVAPD now has a fault-preserving aligned load path.
     legacy = list(Decoder(64, bytes.fromhex("66 0f 28 01 c3")))
-    try:
-        lower(legacy, [], {}, {}, {})
-    except ValueError as error:
-        assert "unsupported" in str(error), error
-    else:
-        raise AssertionError("accepted an unsupported legacy aligned move")
+    source = lower(legacy, [], {}, {}, {})
+    assert source.count("load_legacy_aligned_m128(") == 1, source
     aligned_store = list(Decoder(64, bytes.fromhex("c5 f9 7f 01 c3")))
     source = lower(aligned_store, [], {}, {}, {})
     assert "if (target & 15u) raise_aligned_m128_fault();" in source, source

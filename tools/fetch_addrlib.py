@@ -23,6 +23,17 @@ def git(*args, cwd=None):
     subprocess.run(["git", *args], cwd=cwd, check=True)
 
 
+def git_output(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def require_clean(dest):
+    dirty = git_output("status", "--porcelain", "--untracked-files=all", "--ignored", cwd=dest)
+    if dirty:
+        sys.exit(f"{dest} has local changes. Keep them and choose an empty --dest.\n{dirty}")
+
+
 def main():
     root = pathlib.Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -30,14 +41,21 @@ def main():
     args = parser.parse_args()
     dest = args.dest.resolve()
 
-    if not (dest / ".git").exists():
+    if (dest / ".git").is_dir():
+        if git_output("remote", "get-url", "origin", cwd=dest) != URL:
+            sys.exit(f"{dest} is not the Mesa dependency checkout. Choose an empty --dest.")
+        require_clean(dest)
+    else:
         dest.mkdir(parents=True, exist_ok=True)
+        if any(dest.iterdir()):
+            sys.exit(f"{dest} is not empty. Choose an empty --dest.")
         git("init", "-q", cwd=dest)
         git("remote", "add", "origin", URL, cwd=dest)
     git("sparse-checkout", "set", "--cone", SUBDIR, cwd=dest)
     git("fetch", "--depth", "1", "--filter=blob:none", "origin", COMMIT, cwd=dest)
     git("checkout", "-q", "--detach", COMMIT, cwd=dest)
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dest, check=True, capture_output=True, text=True).stdout.strip()
+    require_clean(dest)
+    head = git_output("rev-parse", "HEAD", cwd=dest)
     if head != COMMIT:
         sys.exit(f"checked out {head}, expected {COMMIT}")
     addrlib = dest / SUBDIR

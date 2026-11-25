@@ -19,7 +19,16 @@
 // As in offscreen_check: the first D3D12 hardware adapter in high-performance order, so a hybrid
 // laptop measures its discrete GPU. With XBOX2WINDOWS_ADAPTER, the first whose description
 // contains the value, ignoring case; a value that matches no adapter sets `unmatched`.
-inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmatched)
+// `create(adapter, iid, out)` makes the device; the default is desktop D3D12CreateDevice.
+using CreateDeviceFn = HRESULT (*)(IUnknown* adapter, REFIID iid, void** device);
+
+inline HRESULT create_desktop_device(IUnknown* adapter, REFIID iid, void** device)
+{
+    return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, iid, device);
+}
+
+inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmatched,
+                                                          CreateDeviceFn create = create_desktop_device)
 {
     unmatched = false;
     Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
@@ -28,7 +37,7 @@ inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmat
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (warp) {
         if (SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) {
-            D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+            create(adapter.Get(), IID_PPV_ARGS(&device));
         }
         return device;
     }
@@ -49,7 +58,7 @@ inline Microsoft::WRL::ComPtr<ID3D12Device> create_device(bool warp, bool& unmat
                 match = _wcsnicmp(text, wanted, filter) == 0;
             if (!match) continue;
         }
-        if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+        if (SUCCEEDED(create(adapter.Get(), IID_PPV_ARGS(&device)))) {
             std::printf("device adapter %04x:%04x %ls\n", desc.VendorId, desc.DeviceId, desc.Description);
             return device;
         }

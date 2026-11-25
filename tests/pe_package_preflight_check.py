@@ -2,14 +2,19 @@
 
 import json
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import pefile
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
+from compat_report_check import POSITIVE_IMPORTS, build_image  # noqa: E402
+from pe_inventory import exports, parse_image  # noqa: E402
 from pe_package_preflight import inspect, main, summarize  # noqa: E402
 from pe_run_package import plan  # noqa: E402
 
@@ -154,6 +159,22 @@ class OfflinePreflightChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Entry is not"):
             summarize(self.package, "missing.exe")
 
+    def test_strict_plan_refuses_external_provider(self):
+        package = {
+            "app.exe": info("app", imports=[("normal", "xgameruntime.dll", "XUserAddAsync")]),
+        }
+        report = summarize(package, "app.exe")
+        row = report["imports"][0]
+        self.assertEqual(row["status"], "external_unverified")
+        self.assertFalse(row["chain"][0]["package"])
+        with self.assertRaisesRegex(
+                ValueError, r"app\.exe: xgameruntime\.dll!XUserAddAsync: external_unverified"):
+            plan(report, allow_external=False)
+        order, bindings = plan(report)
+        self.assertEqual(order, ["app.exe"])
+        self.assertEqual(bindings["app.exe"][("xgameruntime.dll", "XUserAddAsync")]["dll"],
+                         "xgameruntime.dll")
+
     def test_inspect_never_executes_and_ignores_non_pe_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -173,7 +194,20 @@ class OfflinePreflightChecks(unittest.TestCase):
                 inspect(root, "../outside.exe")
             with self.assertRaisesRegex(ValueError, "Entry must be"):
                 inspect(root, "data.rpf")
-            (root / "linked.dll").symlink_to(root / "shim.dll")
+
+    def test_inspect_refuses_a_symlinked_pe_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.exe").write_bytes(b"source-built synthetic fixture")
+            (root / "shim.dll").write_bytes(b"source-built synthetic fixture")
+            try:
+                (root / "linked.dll").symlink_to(root / "shim.dll")
+            except OSError as error:
+                # Windows refuses symlink creation without Developer Mode or
+                # SeCreateSymbolicLinkPrivilege (ERROR_PRIVILEGE_NOT_HELD).
+                if getattr(error, "winerror", None) != 1314:
+                    raise
+                self.skipTest("this Windows account cannot create symlinks (WinError 1314)")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 inspect(root, "main.exe")
 
@@ -201,6 +235,32 @@ class OfflinePreflightChecks(unittest.TestCase):
             assert "pe_package_preflight:" in process.stderr
             assert "Traceback" not in process.stderr
             assert process.stdout == ""
+
+    def test_image_without_data_directories_has_no_exports(self):
+        data = bytearray(build_image(POSITIVE_IMPORTS))
+        count_offset = struct.unpack_from("<I", data, 60)[0] + 4 + 20 + 108
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            control = root / "control.exe"
+            control.write_bytes(bytes(data))
+            with pefile.PE(str(control), fast_load=True) as pe:
+                assert len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) == 16
+                assert exports(pe) == []
+            assert len(parse_image(control)[1]) > 0
+
+            struct.pack_into("<I", data, count_offset, 0)
+            (root / "app.exe").write_bytes(bytes(data))
+            with pefile.PE(str(root / "app.exe"), fast_load=True) as pe:
+                assert len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) == 0
+                assert exports(pe) == []
+            info, imports = parse_image(root / "app.exe")
+            assert info["exports"] == []
+            process = subprocess.run([sys.executable, "-B", str(ROOT / "tools/pe_package_preflight.py"),
+                                      str(root), "app.exe"], capture_output=True, text=True)
+            assert process.returncode == 0, process.stderr
+            assert "Traceback" not in process.stderr
+            report = json.loads(process.stdout)
+            assert report["images"]["app.exe"]["exports"] == 0
 
 
 if __name__ == "__main__":

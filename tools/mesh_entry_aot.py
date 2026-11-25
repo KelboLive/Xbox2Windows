@@ -1,5 +1,7 @@
 """Specialize a bounded, two-wave gfx1013 mesh entry for desktop D3D12.
 
+The allocation may declare up to 128 vertices and primitives within the PSV0
+output bounds; the compute fallback keeps a single three-vertex triangle.
 Geometry words and dispatch ABI are static inputs. Position and transform buffers
 remain GPU inputs. Only forward control flow decided by static values is accepted.
 """
@@ -22,6 +24,22 @@ def span(token):
     if not m or int(m[2]) < int(m[1]):
         raise ValueError("Invalid register span")
     return range(int(m[1]), int(m[2]) + 1)
+
+
+# One-source binary32 forms and their HLSL lowering. round is round-half-even, like v_rndne_f32. The result of
+# rcp, rsq and sqrt is whatever the host computes; callers must only rely on inputs whose result is exact.
+UNARY_F32_EXPR = {
+    "v_rcp_f32": "(1.0f / {x})",
+    "v_rsq_f32": "rsqrt({x})",
+    "v_sqrt_f32": "sqrt({x})",
+    "v_floor_f32": "floor({x})",
+    "v_trunc_f32": "trunc({x})",
+    "v_rndne_f32": "round({x})",
+    # v_fract_f32 is x - floor(x) clamped to 0x3f7fffff: a tiny negative input must not round up to 1.0. The cap is a
+    # comparison, not min: D3D min returns its other operand for a NaN, and a NaN input must stay NaN.
+    "v_fract_f32": "(frac({x}) >= 1.0f ? asfloat(0x3f7fffffu) : frac({x}))",
+}
+UNARY_F32 = {f"{name}_e{width}": expr for name, expr in UNARY_F32_EXPR.items() for width in (32, 64)}
 
 
 # Inline raw descriptor constructed from the two bound entry SGPRs, a byte
@@ -198,8 +216,12 @@ class Wave:
             v = a << (b & 31)
         elif op == "s_lshr_b32":
             v = (a & U32) >> (b & 31)
-        elif op == "s_add_i32":
+        elif op in ("s_add_i32", "s_add_u32"):
             v = a + b
+        elif op == "s_sub_u32":
+            v = a - b
+        elif op == "s_mul_i32":
+            v = a * b
         elif op == "s_and_b32" or op == "s_and_b64":
             v = a & b
         elif op in ("s_or_b32", "s_or_b64"):
@@ -212,7 +234,11 @@ class Wave:
             raise ValueError(f"Unsupported scalar instruction {op}")
         wide = op.endswith("_b64")
         self.put(d, v, wide)
-        if not op.startswith(("s_mov", "s_cselect")):
+        if op == "s_add_u32":
+            self.scc = (a & U32) + (b & U32) > U32
+        elif op == "s_sub_u32":
+            self.scc = (a & U32) < (b & U32)
+        elif not op.startswith(("s_mov", "s_cselect", "s_mul")):
             self.scc = (
                 bool((~(a ^ b) & (a ^ v)) & (1 << 31))
                 if op == "s_add_i32"
@@ -250,8 +276,26 @@ class Wave:
             "v_fmac_f32_e32",
             "v_fmac_f32_e64",
             "v_add_f32_e32",
+            "v_add_f32_e64",
+            "v_sub_f32_e32",
+            "v_sub_f32_e64",
+            "v_subrev_f32_e32",
+            "v_subrev_f32_e64",
+            "v_mul_f32_e32",
+            "v_mul_f32_e64",
             "v_fma_f32",
+            "v_cvt_f32_u32_e32",
+            "v_cvt_f32_u32_e64",
+            "v_cvt_f32_i32_e32",
+            "v_cvt_f32_i32_e64",
+            "v_min_f32_e32",
+            "v_min_f32_e64",
+            "v_max_f32_e32",
+            "v_max_f32_e64",
+            *UNARY_F32,
         }
+        if op in UNARY_F32 and len(src) != 1:
+            raise ValueError(f"{op} takes one source")
         for lane in live:
             vals = [self.lane_value(t, lane) for t in src]
             if (
@@ -276,6 +320,16 @@ class Wave:
                 )
             elif op == "v_add_nc_u32_e32":
                 v = a + b
+            elif op == "v_sub_nc_u32_e32":
+                v = a - b
+            elif op == "v_or_b32_e32":
+                v = a | b
+            elif op == "v_xor_b32_e32":
+                v = a ^ b
+            elif op == "v_min_u32_e32":
+                v = min(a & U32, b & U32)
+            elif op == "v_max_u32_e32":
+                v = max(a & U32, b & U32)
             elif op == "v_mad_u32_u24":
                 v = (a & 0xFFFFFF) * (b & 0xFFFFFF) + vals[2]
             elif op == "v_lshrrev_b32_e32":
@@ -302,6 +356,22 @@ class Wave:
                     expr = f"mad({x}, {y}, {fp(vals[2])})"
                 elif op.startswith("v_fmac_f32_"):
                     expr = f"mad({x}, {y}, {fp(self.lane_value(d, lane))})"
+                elif op.startswith("v_mul_f32_"):
+                    expr = f"({x} * {y})"
+                elif op.startswith("v_sub_f32_"):
+                    expr = f"({x} - {y})"
+                elif op.startswith("v_subrev_f32_"):
+                    expr = f"({y} - {x})"
+                elif op.startswith("v_cvt_f32_"):
+                    # The source is an integer word, never a float expression.
+                    if not isinstance(a, int):
+                        raise ValueError("Integer conversion requires a concrete operand")
+                    word = f"0x{a & U32:08x}u"
+                    expr = f"float({word})" if "_u32_" in op else f"float(asint({word}))"
+                elif op.startswith(("v_min_f32_", "v_max_f32_")):
+                    expr = f"{op[2:5]}({x}, {y})"
+                elif op in UNARY_F32:
+                    expr = UNARY_F32[op].format(x=x)
                 else:
                     expr = f"({x} + {y})"
                 if expr not in expressions:
@@ -510,8 +580,11 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     if attributes and attributes.keys() != pos.keys():
         raise ValueError("Incomplete vertex attribute")
     idx = waves[0].indices | waves[1].indices
-    if (nv, np) != (3, 1):
-        raise ValueError("Expected a single three-vertex triangle")
+    # The native mesh shader writes any allocation within the PSV0 bounds. Each of the
+    # 128 threads exports at most one vertex and one primitive, so every allocated
+    # slot must be exported exactly once and nothing outside the allocation may be.
+    if compute_fallback and (nv, np) != (3, 1):
+        raise ValueError("The compute fallback translates only a single three-vertex triangle")
     if (
         not 0 < nv <= limits[0]
         or not 0 < np <= limits[1]
@@ -573,8 +646,41 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     return "\n".join(lines) + "\n"
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+STAGE_NAMES = {
+    0: "pixel",
+    1: "vertex",
+    2: "geometry",
+    3: "hull",
+    4: "domain",
+    5: "compute",
+    6: "library",
+    13: "mesh",
+    14: "amplification",
+}
+
+
+def require_mesh_stage(chunks):
+    """Reject any other stage by name before the mesh profile checks."""
+    psv = chunks[b"PSV0"]
+    program = chunks[b"DXIL"]
+    kind = struct.unpack_from("<H", program, 2)[0] if len(program) >= 4 else None
+    for stage in (psv[28] if len(psv) > 28 else None, kind):
+        if stage == 13:
+            continue
+        if stage == 14:
+            raise ValueError(
+                "Unsupported amplification stage: only the bounded mesh stage is translated"
+            )
+        if stage is not None:
+            name = STAGE_NAMES.get(stage, f"stage {stage}")
+            raise ValueError(
+                f"Unsupported {name} stage: only the bounded mesh stage is translated"
+            )
+
+
+def decode_mesh(blob, library):
     chunks = parts(blob)
+    require_mesh_stage(chunks)
     p = chunks[b"PSV0"]
     if (
         len(p) < 52
@@ -588,15 +694,12 @@ def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=F
     if any(not 0 < n <= 256 for n in limits):
         raise ValueError("Invalid mesh declaration")
     code = container_code(chunks[b"DXIL"], stage=13)
-    return lower(
-        disassemble(
-            code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"
-        ),
-        geometry,
-        limits,
-        vertex_header,
-        compute_fallback=compute_fallback,
-    )
+    return disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"), limits
+
+
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+    decoded, limits = decode_mesh(blob, library)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
 
 
 if __name__ == "__main__":

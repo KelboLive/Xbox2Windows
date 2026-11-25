@@ -560,7 +560,7 @@ def check_controls() -> None:
     reject_cases = (
         ("MMX paddb mm0, mm1", "0f fc c1 c3"),
         ("MMX phaddw mm0, mm1", "0f 38 01 c1 c3"),
-        ("VEX vaddsubps xmm0, xmm1, xmm2", "c5 f3 d0 c2 c3"),
+        ("VEX vaddsubps with untracked source xmm3", "c5 f3 d0 c3 c3"),
         ("VEX vroundps with dynamic MXCSR rounding", "c4 e3 79 08 c1 04 c3"),
         ("VEX vdpps with untracked source xmm4", "c4 e3 71 40 c4 f1 c3"),
         ("VEX vblendps with untracked source xmm4", "c4 e3 71 0c c4 05 c3"),
