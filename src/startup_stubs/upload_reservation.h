@@ -12,8 +12,8 @@ struct UploadRingChunk {
     unsigned char* mapped = nullptr;
     std::uint64_t capacity = 0;
     std::uint64_t used = 0;
+    std::size_t unsubmitted_lists = 0;
     std::vector<std::pair<ID3D12Fence*, std::uint64_t>> submits{};
-    bool unsubmitted = false;
 };
 
 struct UploadReservation {
@@ -28,13 +28,23 @@ inline UploadReservation reserve_upload_chunk(UploadRingChunk& chunk, std::uint6
     if (chunk.used > chunk.capacity || rounded > chunk.capacity - chunk.used) return {};
     const auto start = chunk.used;
     chunk.used += rounded;
-    chunk.unsubmitted = true;
     return {chunk.mapped + start, start, chunk.resource};
+}
+
+template<typename FenceQuery>
+inline bool is_upload_chunk_idle(const UploadRingChunk& chunk, FenceQuery&& query)
+{
+    if (chunk.unsubmitted_lists != 0) return false;
+    for (const auto& submit : chunk.submits) {
+        if (!submit.first) return false;
+        if (query(submit.first) < submit.second) return false;
+    }
+    return true;
 }
 
 inline void reset_upload_chunk(UploadRingChunk& chunk)
 {
     chunk.used = 0;
     chunk.submits.clear();
-    chunk.unsubmitted = false;
+    chunk.unsubmitted_lists = 0;
 }

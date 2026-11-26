@@ -64,10 +64,46 @@ int main()
           "existing reservations survive exhaustion");
 
     reset_upload_chunk(chunks[0]);
-    check(chunks[0].used == 0 && !chunks[0].unsubmitted, "reset clears cursor and unsubmitted flag");
+    check(chunks[0].used == 0 && chunks[0].unsubmitted_lists == 0 && chunks[0].submits.empty(),
+          "reset clears cursor, unsubmitted count and submits");
     const auto recycled = reserve_upload_chunk(chunks[0], kAlign);
-    check(recycled.mapped == storage_a && recycled.offset == 0 && chunks[0].unsubmitted,
+    check(recycled.mapped == storage_a && recycled.offset == 0,
           "recycled chunk reserves from start");
+
+    // Guard fence logic and unsubmitted tracking:
+    struct MockFence {
+        std::uint64_t completed = 0;
+    };
+    MockFence fence_a;
+    MockFence fence_b;
+    const auto fence_query = [](const ID3D12Fence* f) {
+        return reinterpret_cast<const MockFence*>(f)->completed;
+    };
+
+    check(is_upload_chunk_idle(chunks[0], fence_query), "chunk without unsubmitted lists or submits is idle");
+
+    chunks[0].unsubmitted_lists = 1;
+    check(!is_upload_chunk_idle(chunks[0], fence_query), "chunk with unsubmitted lists is not idle");
+
+    chunks[0].unsubmitted_lists = 0;
+    chunks[0].submits.emplace_back(reinterpret_cast<ID3D12Fence*>(&fence_a), 10);
+    fence_a.completed = 9;
+    check(!is_upload_chunk_idle(chunks[0], fence_query), "chunk with in-flight submit is not idle");
+
+    fence_a.completed = 10;
+    check(is_upload_chunk_idle(chunks[0], fence_query), "chunk with completed submit is idle");
+
+    // Multi-queue submits:
+    chunks[0].submits.emplace_back(reinterpret_cast<ID3D12Fence*>(&fence_b), 5);
+    fence_b.completed = 4;
+    check(!is_upload_chunk_idle(chunks[0], fence_query), "chunk with second pending queue submit is not idle");
+
+    fence_b.completed = 5;
+    check(is_upload_chunk_idle(chunks[0], fence_query), "chunk with all queue submits completed is idle");
+
+    reset_upload_chunk(chunks[0]);
+    check(chunks[0].used == 0 && chunks[0].unsubmitted_lists == 0 && chunks[0].submits.empty(),
+          "final reset clears submits");
 
     std::puts("upload_reservation_check: all checks passed");
     return 0;

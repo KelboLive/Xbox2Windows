@@ -601,6 +601,16 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         }
         Sleep(250);
         if (invoke(fence, 8) != 0) return 46;  // a submit completed although the queue was held
+        // Negative control: while the queue is held behind the gate, any new reservation must be
+        // refused because storage is in-flight. If early reuse wrongly recycled chunks before
+        // completion, this draw would overwrite chunk 0 while payload 0 is still in flight.
+        if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", nullptr, 0)) {
+            if (!next_recording()) return 35;
+            if (const int result = draw_gated_console_payload(guest, list, 99, false)) return result;
+            invoke(list, 9);
+            invoke(queue, 10, 1, arg(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1)))) return 24;
+        }
         if (FAILED(static_cast<HRESULT>(invoke(gate, 10, 1)))) return 47;
         // One more recording without a draw: its submit is where the stand-in visits the completed ones.
         const auto reached = [&](UINT64 value) {
@@ -608,11 +618,13 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
             return invoke(fence, 8) == value;
         };
-        if (!reached(payloads)) return 25;
+        const UINT64 gate_fence = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", nullptr, 0)
+            ? payloads + 1 : payloads;
+        if (!reached(gate_fence)) return 25;
         if (!next_recording()) return 35;
         invoke(list, 9);
         invoke(queue, 10, 1, arg(&list));
-        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1))) || !reached(payloads + 1)) return 25;
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), gate_fence + 1))) || !reached(gate_fence + 1)) return 25;
         // X2W_TEST_ADDRESS_UPLOAD_RING_REUSE: every earlier upload has now completed, so one more payload over
         // the right half must find ring capacity again (refs #2823).
         if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", nullptr, 0)) {
@@ -620,7 +632,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             if (const int result = draw_gated_console_payload(guest, list, payloads, false)) return result;
             invoke(list, 9);
             invoke(queue, 10, 1, arg(&list));
-            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 2))) || !reached(payloads + 2)) return 25;
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), gate_fence + 2))) || !reached(gate_fence + 2)) return 25;
         }
         return read_stream_target(desktop.Get(), frame, pixels);
     } else if (bc) {

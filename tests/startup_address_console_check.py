@@ -222,9 +222,11 @@ def gate_colour(payload):
 def check_gate_ring_reuse(directory, consumer, backend):
     """After the gate-ring sequence has completed, one more payload must find ring capacity again.
 
-    The fixture runs the gate-ring draws, waits until every submit has completed, then draws payload 18 over
-    the right half from the ring. Nothing is in flight any more, so the reservation must succeed: the left half
-    holds payload 0 and the right half payload 18, not the null view.
+    The fixture runs the gate-ring draws. While the queue is still held behind the gate, a negative
+    control draw attempts a reservation from the exhausted ring; because submissions are still in flight,
+    the reservation must be refused and payload 0 on the left half preserved. Once every submit has
+    completed, a final draw uploads payload 18 over the right half from the recycled ring. The left half
+    must hold payload 0 and the right half payload 18.
     """
     hlsl = ("Texture2D<float4> t : register(t0);\n"
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
@@ -250,6 +252,9 @@ def check_gate_ring_reuse(directory, consumer, backend):
     if wrong["left"] or wrong["right"]:
         raise AssertionError(f"gate-ring-reuse: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected "
                              f"{first.hex()} left, {last.hex()} right (payload {GATE_PAYLOADS} after completion)")
+    log = trap_log.read_text(errors="replace")
+    if "x2w-draw upload ring reservation refused: no unused capacity" not in log:
+        raise AssertionError("gate-ring-reuse: expected upload reservation refusal while queue was held")
     half = TARGET_W * TARGET_H // 2
     print(f"{backend} gate-ring-reuse: after all submits completed, payload {GATE_PAYLOADS} was uploaded from the ring; "
           f"{half} left pixels hold payload 0 and {half} right pixels payload {GATE_PAYLOADS}")

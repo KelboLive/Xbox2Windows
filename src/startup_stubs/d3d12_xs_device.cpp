@@ -1648,9 +1648,10 @@ bool submit_fence_fails()
 // draw_lock and allocator_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
 // the queue must pass before the allocator can be reset. If that fence cannot be created or
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
-void note_upload_ring_submit(ID3D12Fence* fence, UINT64 value);
+void note_upload_ring_submits(ID3D12Fence* fence, UINT64 value, const std::vector<ID3D12CommandList*>& lists);
+void discard_upload_ring(ID3D12CommandList* list);
 
-void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
+void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists, const std::vector<ID3D12CommandList*>& native_lists)
 {
     auto& [fence, value] = queue_submits[queue];
     if (!fence && !submit_fence_fails()) {
@@ -1662,7 +1663,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     }
     if (fence && SUCCEEDED(queue->Signal(fence, value + 1))) {
         ++value;
-        note_upload_ring_submit(fence, value);
+        note_upload_ring_submits(fence, value, native_lists);
         for (Wrapper* list : lists) {
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
@@ -1807,6 +1808,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(previous);
         discard_address_uploads(previous);
+        discard_upload_ring(previous);
         discard_mesh_lease_recording(previous);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(previous);
@@ -1845,6 +1847,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         discard_list_gpu_writes(self);
         discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
+        discard_upload_ring(list);
         discard_mesh_lease_recording(list);
         retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(list);
@@ -2425,21 +2428,62 @@ static SRWLOCK upload_ring_lock = SRWLOCK_INIT;
 static std::vector<UploadRingChunk> upload_ring_chunks;
 static std::size_t upload_ring_active = 0;
 static u64 upload_ring_total_bytes = 0;
+static std::unordered_map<ID3D12CommandList*, std::vector<std::size_t>> recorded_upload_chunks;
 
-void note_upload_ring_submit(ID3D12Fence* fence, UINT64 value)
+void note_upload_ring_submits(ID3D12Fence* fence, UINT64 value, const std::vector<ID3D12CommandList*>& lists)
 {
     if (!fence) return;
     AcquireSRWLockExclusive(&upload_ring_lock);
-    for (auto& chunk : upload_ring_chunks) {
-        if (chunk.unsubmitted) {
-            const auto it = std::find_if(chunk.submits.begin(), chunk.submits.end(),
-                [fence](const auto& s) { return s.first == fence; });
-            if (it != chunk.submits.end()) {
-                it->second = value;
-            } else {
-                chunk.submits.emplace_back(fence, value);
+    for (auto* list : lists) {
+        const auto it = recorded_upload_chunks.find(list);
+        if (it == recorded_upload_chunks.end()) continue;
+        for (std::size_t chunk_idx : it->second) {
+            if (chunk_idx < upload_ring_chunks.size()) {
+                auto& chunk = upload_ring_chunks[chunk_idx];
+                if (chunk.unsubmitted_lists > 0) --chunk.unsubmitted_lists;
+                const auto sub = std::find_if(chunk.submits.begin(), chunk.submits.end(),
+                    [fence](const auto& s) { return s.first == fence; });
+                if (sub != chunk.submits.end()) {
+                    sub->second = value;
+                } else {
+                    chunk.submits.emplace_back(fence, value);
+                }
             }
-            chunk.unsubmitted = false;
+        }
+        recorded_upload_chunks.erase(it);
+    }
+    ReleaseSRWLockExclusive(&upload_ring_lock);
+}
+
+void discard_upload_ring(ID3D12CommandList* list)
+{
+    if (!list) return;
+    AcquireSRWLockExclusive(&upload_ring_lock);
+    const auto it = recorded_upload_chunks.find(list);
+    if (it != recorded_upload_chunks.end()) {
+        for (std::size_t chunk_idx : it->second) {
+            if (chunk_idx < upload_ring_chunks.size()) {
+                auto& chunk = upload_ring_chunks[chunk_idx];
+                if (chunk.unsubmitted_lists > 0) --chunk.unsubmitted_lists;
+            }
+        }
+        recorded_upload_chunks.erase(it);
+    }
+    ReleaseSRWLockExclusive(&upload_ring_lock);
+}
+
+void note_upload_ring_use(ID3D12Resource* resource, ID3D12CommandList* list)
+{
+    if (!resource || !list) return;
+    AcquireSRWLockExclusive(&upload_ring_lock);
+    for (std::size_t i = 0; i < upload_ring_chunks.size(); ++i) {
+        if (upload_ring_chunks[i].resource == resource) {
+            auto& chunks = recorded_upload_chunks[list];
+            if (std::find(chunks.begin(), chunks.end(), i) == chunks.end()) {
+                chunks.push_back(i);
+                ++upload_ring_chunks[i].unsubmitted_lists;
+            }
+            break;
         }
     }
     ReleaseSRWLockExclusive(&upload_ring_lock);
@@ -2447,16 +2491,12 @@ void note_upload_ring_submit(ID3D12Fence* fence, UINT64 value)
 
 static bool is_upload_chunk_idle(const UploadRingChunk& chunk)
 {
-    if (chunk.unsubmitted) return false;
-    if (chunk.submits.empty()) return chunk.used == 0;
-    for (const auto& submit : chunk.submits) {
-        if (!submit.first) return false;
-        if (submit.first->GetCompletedValue() < submit.second) return false;
-    }
-    return true;
+    return is_upload_chunk_idle(chunk, [](ID3D12Fence* fence) {
+        return fence->GetCompletedValue();
+    });
 }
 
-UploadReservation reserve_upload_ring(std::size_t bytes)
+UploadReservation reserve_upload_ring(std::size_t bytes, ID3D12CommandList* list = nullptr)
 {
     constexpr u64 initial_chunk_bytes = u64{16} << 20;
     constexpr u64 max_total_bytes = u64{256} << 20;
@@ -2466,9 +2506,19 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
     AcquireSRWLockExclusive(&upload_ring_lock);
+    const auto note_list = [&](std::size_t index) {
+        if (!list) return;
+        auto& chunks = recorded_upload_chunks[list];
+        if (std::find(chunks.begin(), chunks.end(), index) == chunks.end()) {
+            chunks.push_back(index);
+            ++upload_ring_chunks[index].unsubmitted_lists;
+        }
+    };
+
     if (!upload_ring_chunks.empty()) {
         reservation = reserve_upload_chunk(upload_ring_chunks[upload_ring_active], rounded);
         if (reservation.mapped) {
+            note_list(upload_ring_active);
             ReleaseSRWLockExclusive(&upload_ring_lock);
             return reservation;
         }
@@ -2501,6 +2551,7 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
                         upload_ring_total_bytes += chunk_bytes;
                         upload_ring_active = upload_ring_chunks.size() - 1;
                         reservation = reserve_upload_chunk(upload_ring_chunks.back(), rounded);
+                        note_list(upload_ring_active);
                         ReleaseSRWLockExclusive(&upload_ring_lock);
                         return reservation;
                     } catch (const std::bad_alloc&) {
@@ -2520,6 +2571,7 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
         reservation = reserve_upload_chunk(upload_ring_chunks[index], rounded);
         if (reservation.mapped) {
             upload_ring_active = index;
+            note_list(upload_ring_active);
             ReleaseSRWLockExclusive(&upload_ring_lock);
             return reservation;
         }
@@ -2535,6 +2587,7 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
                 reservation = reserve_upload_chunk(chunk, rounded);
                 if (reservation.mapped) {
                     upload_ring_active = index;
+                    note_list(upload_ring_active);
                     ReleaseSRWLockExclusive(&upload_ring_lock);
                     return reservation;
                 }
@@ -2549,26 +2602,26 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
     return reservation;
 }
 
-unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource)
+unsigned char* reserve_upload_ring(std::size_t bytes, u64* offset, ID3D12Resource** resource, ID3D12CommandList* list = nullptr)
 {
     if (resource) *resource = nullptr;
     if (offset) *offset = 0;
-    const UploadReservation reservation = reserve_upload_ring(bytes);
+    const UploadReservation reservation = reserve_upload_ring(bytes, list);
     if (!reservation.mapped) return nullptr;
     if (offset) *offset = reservation.offset;
     if (resource) *resource = reservation.resource;
     return reservation.mapped;
 }
 
-bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr)
+bool ring_copy(u64 title_address, std::size_t bytes, u64* offset, ID3D12Resource** resource = nullptr, ID3D12CommandList* list = nullptr)
 {
-    auto* dest = reserve_upload_ring(bytes, offset, resource);
+    auto* dest = reserve_upload_ring(bytes, offset, resource, list);
     if (!dest) return false;
     std::memcpy(dest, reinterpret_cast<const void*>(title_address), bytes);
     return true;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes)
+D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes, ID3D12CommandList* list = nullptr)
 {
     u64 offset = 0;
     ID3D12Resource* resource = nullptr;
@@ -3928,7 +3981,7 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
         return;
     }
     const std::size_t bytes = readable_window(address, 0x10000);
-    const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes) : 0;
+    const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes, list) : 0;
     static LONG logged;
     if (first_calls(logged, 4)) {
         char head[3 * 32 + 1];
@@ -4110,7 +4163,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             });
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
-            note_submits(queue, wrappers);
+            note_submits(queue, wrappers, native_lists);
             retire_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
