@@ -3358,9 +3358,9 @@ uncovered prefix, and right before
 `OpenExistingHeapFromAddress` opens the heap). Anything else gets a
 committed default buffer that does not alias the title memory, holds zeros and is reported as
 success (`not aliased` in the log). `reserve_upload_ring` grows in demand
-chunks from 16 MiB up to the 256 MiB total cap. A reservation owns its mapped
-bytes for the process; the allocator may use an older unused tail but
-refuses exhaustion or allocation failure rather than resetting live storage.
+chunks from 16 MiB up to the 256 MiB total cap. Completed chunks whose queue
+submissions have finished on the GPU are reused; storage still in flight is
+never reused, and exhaustion refuses new reservations.
 `upload_reservation` exercises the shared cursor and returned-pointer contract
 without D3D12; on non-Windows hosts run
 `c++ -std=c++17 -Isrc tests/upload_reservation_check.cpp -o out/upload_reservation_check && out/upload_reservation_check`.

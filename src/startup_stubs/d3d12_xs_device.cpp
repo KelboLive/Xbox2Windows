@@ -1648,6 +1648,8 @@ bool submit_fence_fails()
 // draw_lock and allocator_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
 // the queue must pass before the allocator can be reset. If that fence cannot be created or
 // signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
+void note_upload_ring_submit(ID3D12Fence* fence, UINT64 value);
+
 void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
 {
     auto& [fence, value] = queue_submits[queue];
@@ -1660,6 +1662,7 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     }
     if (fence && SUCCEEDED(queue->Signal(fence, value + 1))) {
         ++value;
+        note_upload_ring_submit(fence, value);
         for (Wrapper* list : lists) {
             const auto found = list_recordings.find(list);
             if (found == list_recordings.end()) continue;
@@ -2414,8 +2417,44 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
 }
 
 // Transient guest data is copied into mapped upload chunks. Chunks grow from
-// 16 MiB up to 256 MiB in total and stay alive for the process. Exhaustion
-// refuses new reservations rather than reusing storage without completion.
+// 16 MiB up to 256 MiB in total and stay alive for the process. Completed chunks
+// whose queue submissions have finished on the GPU are reused; storage still in
+// flight is never reused, and exhaustion refuses new reservations.
+
+static SRWLOCK upload_ring_lock = SRWLOCK_INIT;
+static std::vector<UploadRingChunk> upload_ring_chunks;
+static std::size_t upload_ring_active = 0;
+static u64 upload_ring_total_bytes = 0;
+
+void note_upload_ring_submit(ID3D12Fence* fence, UINT64 value)
+{
+    if (!fence) return;
+    AcquireSRWLockExclusive(&upload_ring_lock);
+    for (auto& chunk : upload_ring_chunks) {
+        if (chunk.unsubmitted) {
+            const auto it = std::find_if(chunk.submits.begin(), chunk.submits.end(),
+                [fence](const auto& s) { return s.first == fence; });
+            if (it != chunk.submits.end()) {
+                it->second = value;
+            } else {
+                chunk.submits.emplace_back(fence, value);
+            }
+            chunk.unsubmitted = false;
+        }
+    }
+    ReleaseSRWLockExclusive(&upload_ring_lock);
+}
+
+static bool is_upload_chunk_idle(const UploadRingChunk& chunk)
+{
+    if (chunk.unsubmitted) return false;
+    if (chunk.submits.empty()) return chunk.used == 0;
+    for (const auto& submit : chunk.submits) {
+        if (!submit.first) return false;
+        if (submit.first->GetCompletedValue() < submit.second) return false;
+    }
+    return true;
+}
 
 UploadReservation reserve_upload_ring(std::size_t bytes)
 {
@@ -2426,23 +2465,18 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
     if (bytes == 0 || bytes > max_alloc_bytes) return reservation;
     const u64 rounded = (static_cast<u64>(bytes) + 511) & ~u64{511};
 
-    static SRWLOCK lock = SRWLOCK_INIT;
-    static std::vector<UploadRingChunk> chunks;
-    static std::size_t active = 0;
-    static u64 total_bytes = 0;
-
-    AcquireSRWLockExclusive(&lock);
-    if (!chunks.empty()) {
-        reservation = reserve_upload_chunk(chunks[active], rounded);
+    AcquireSRWLockExclusive(&upload_ring_lock);
+    if (!upload_ring_chunks.empty()) {
+        reservation = reserve_upload_chunk(upload_ring_chunks[upload_ring_active], rounded);
         if (reservation.mapped) {
-            ReleaseSRWLockExclusive(&lock);
+            ReleaseSRWLockExclusive(&upload_ring_lock);
             return reservation;
         }
     }
 
-    const u64 remaining = total_bytes < max_total_bytes ? max_total_bytes - total_bytes : 0;
+    const u64 remaining = upload_ring_total_bytes < max_total_bytes ? max_total_bytes - upload_ring_total_bytes : 0;
     if (rounded <= remaining) {
-        u64 chunk_bytes = chunks.empty() ? initial_chunk_bytes : chunks.back().capacity * 2;
+        u64 chunk_bytes = upload_ring_chunks.empty() ? initial_chunk_bytes : upload_ring_chunks.back().capacity * 2;
         if (chunk_bytes < rounded) chunk_bytes = rounded;
         if (chunk_bytes > remaining) chunk_bytes = remaining;
         auto* device = the_device ? device_of(the_device) : nullptr;
@@ -2463,11 +2497,11 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
                 auto* budget = x2w_budget::committed(device, created, D3D12_HEAP_TYPE_UPLOAD);
                 if (SUCCEEDED(created->Map(0, nullptr, &base))) {
                     try {
-                        chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
-                        total_bytes += chunk_bytes;
-                        active = chunks.size() - 1;
-                        reservation = reserve_upload_chunk(chunks.back(), rounded);
-                        ReleaseSRWLockExclusive(&lock);
+                        upload_ring_chunks.push_back(UploadRingChunk{created, static_cast<unsigned char*>(base), chunk_bytes, 0});
+                        upload_ring_total_bytes += chunk_bytes;
+                        upload_ring_active = upload_ring_chunks.size() - 1;
+                        reservation = reserve_upload_chunk(upload_ring_chunks.back(), rounded);
+                        ReleaseSRWLockExclusive(&upload_ring_lock);
                         return reservation;
                     } catch (const std::bad_alloc&) {
                         created->Unmap(0, nullptr);
@@ -2482,16 +2516,33 @@ UploadReservation reserve_upload_ring(std::size_t bytes)
         }
     }
     // Allocation failed or the cap was reached. Older unused tails are still safe.
-    for (std::size_t index = 0; index < chunks.size(); ++index) {
-        reservation = reserve_upload_chunk(chunks[index], rounded);
+    for (std::size_t index = 0; index < upload_ring_chunks.size(); ++index) {
+        reservation = reserve_upload_chunk(upload_ring_chunks[index], rounded);
         if (reservation.mapped) {
-            active = index;
-            ReleaseSRWLockExclusive(&lock);
+            upload_ring_active = index;
+            ReleaseSRWLockExclusive(&upload_ring_lock);
             return reservation;
         }
     }
 
-    ReleaseSRWLockExclusive(&lock);
+    // Check if any chunk whose GPU work has completed can be reset.
+    for (std::size_t step = 0; step < upload_ring_chunks.size(); ++step) {
+        const std::size_t index = (upload_ring_active + 1 + step) % upload_ring_chunks.size();
+        auto& chunk = upload_ring_chunks[index];
+        if (is_upload_chunk_idle(chunk)) {
+            reset_upload_chunk(chunk);
+            if (chunk.capacity >= rounded) {
+                reservation = reserve_upload_chunk(chunk, rounded);
+                if (reservation.mapped) {
+                    upload_ring_active = index;
+                    ReleaseSRWLockExclusive(&upload_ring_lock);
+                    return reservation;
+                }
+            }
+        }
+    }
+
+    ReleaseSRWLockExclusive(&upload_ring_lock);
     static LONG refused;
     if (first_calls(refused, 8))
         log("x2w-draw upload ring reservation refused: no unused capacity");

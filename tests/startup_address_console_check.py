@@ -8,6 +8,8 @@
   <consumer> <backend> gate-ring     the same draws with X2W_TEST_ADDRESS_UPLOAD_RING=1: the 256 MiB ring
                                      refuses the uploads past its cap, the refused draws read the null view
                                      and the left half keeps payload 0
+  <consumer> <backend> gate-ring-reuse  gate-ring, then once every submit has completed one more payload from
+                                     the ring, which must not be refused
 
 The backing bytes are built here, independently of src/startup_stubs/gfx10_layout.h, from the address
 equations of AMD addrlib's GFX10 pattern tables, written out below. Reference: addrlib as Mesa carries it
@@ -217,6 +219,43 @@ def gate_colour(payload):
     return bytes(((17 * payload + 3) & 255, (255 - 9 * payload) & 255, payload ^ 0x5a, 255))
 
 
+def check_gate_ring_reuse(directory, consumer, backend):
+    """After the gate-ring sequence has completed, one more payload must find ring capacity again.
+
+    The fixture runs the gate-ring draws, waits until every submit has completed, then draws payload 18 over
+    the right half from the ring. Nothing is in flight any more, so the reservation must succeed: the left half
+    holds payload 0 and the right half payload 18, not the null view.
+    """
+    hlsl = ("Texture2D<float4> t : register(t0);\n"
+            "float4 main(float4 p : SV_Position) : SV_Target {\n"
+            "  return t.Load(int3(uint(p.x) % 2048, uint(p.y) % 2048, 0));\n}\n")
+    trap_log = directory / "trap.log"
+    modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log),
+             "X2W_TEST_ADDRESS_UPLOAD_RING": "1", "X2W_TEST_ADDRESS_UPLOAD_RING_REUSE": "1"}
+    actual = draw_texture(directory, consumer, backend, hlsl, modes)
+    if actual is None:
+        return 77
+    if len(actual) != TARGET_W * TARGET_H * 4:
+        raise AssertionError(f"gate-ring-reuse: readback length {len(actual)}")
+    first, last = gate_colour(0), gate_colour(GATE_PAYLOADS)
+    wrong = {"left": 0, "right": 0}
+    seen = set()
+    for y in range(TARGET_H):
+        for x in range(TARGET_W):
+            pixel = actual[4 * (y * TARGET_W + x):4 * (y * TARGET_W + x) + 4]
+            side = "left" if x < TARGET_W // 2 else "right"
+            if pixel != (first if side == "left" else last):
+                wrong[side] += 1
+                seen.add(pixel.hex())
+    if wrong["left"] or wrong["right"]:
+        raise AssertionError(f"gate-ring-reuse: {wrong} wrong pixels, found {sorted(seen)[:4]}; expected "
+                             f"{first.hex()} left, {last.hex()} right (payload {GATE_PAYLOADS} after completion)")
+    half = TARGET_W * TARGET_H // 2
+    print(f"{backend} gate-ring-reuse: after all submits completed, payload {GATE_PAYLOADS} was uploaded from the ring; "
+          f"{half} left pixels hold payload 0 and {half} right pixels payload {GATE_PAYLOADS}")
+    return 0
+
+
 def check_gate(directory, consumer, backend, ring):
     """Uploads recorded while the queue cannot run must still hold their bytes when it does.
 
@@ -282,9 +321,12 @@ def check_gate(directory, consumer, backend, ring):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ("gate", "gate-ring")):
-        usage = "usage: startup_address_console_check.py <consumer> <backend> [gate | gate-ring]\n"
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ("gate", "gate-ring", "gate-ring-reuse")):
+        usage = "usage: startup_address_console_check.py <consumer> <backend> [gate | gate-ring | gate-ring-reuse]\n"
         sys.exit(usage + "\n\n".join(__doc__.split("\n\n")[:2]))
+    if len(sys.argv) == 4 and sys.argv[3] == "gate-ring-reuse":
+        with tempfile.TemporaryDirectory() as temporary:
+            sys.exit(check_gate_ring_reuse(Path(temporary), sys.argv[1], sys.argv[2]))
     if len(sys.argv) == 4:
         with tempfile.TemporaryDirectory() as temporary:
             sys.exit(check_gate(Path(temporary), sys.argv[1], sys.argv[2], sys.argv[3] == "gate-ring"))

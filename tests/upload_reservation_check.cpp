@@ -63,6 +63,12 @@ int main()
           storage_a[2 * kAlign - 1] == 0x5a && storage_a[2 * kAlign] == 0x7d,
           "existing reservations survive exhaustion");
 
+    reset_upload_chunk(chunks[0]);
+    check(chunks[0].used == 0 && !chunks[0].unsubmitted, "reset clears cursor and unsubmitted flag");
+    const auto recycled = reserve_upload_chunk(chunks[0], kAlign);
+    check(recycled.mapped == storage_a && recycled.offset == 0 && chunks[0].unsubmitted,
+          "recycled chunk reserves from start");
+
     std::puts("upload_reservation_check: all checks passed");
     return 0;
 }

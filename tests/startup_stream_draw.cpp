@@ -613,6 +613,15 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         invoke(list, 9);
         invoke(queue, 10, 1, arg(&list));
         if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1))) || !reached(payloads + 1)) return 25;
+        // X2W_TEST_ADDRESS_UPLOAD_RING_REUSE: every earlier upload has now completed, so one more payload over
+        // the right half must find ring capacity again (refs #2823).
+        if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING_REUSE", nullptr, 0)) {
+            if (!next_recording()) return 35;
+            if (const int result = draw_gated_console_payload(guest, list, payloads, false)) return result;
+            invoke(list, 9);
+            invoke(queue, 10, 1, arg(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 2))) || !reached(payloads + 2)) return 25;
+        }
         return read_stream_target(desktop.Get(), frame, pixels);
     } else if (bc) {
         extern int draw_bc_address_srvs(void*, void*);
