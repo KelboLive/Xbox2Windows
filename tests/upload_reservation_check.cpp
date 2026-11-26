@@ -64,13 +64,13 @@ int main()
           "existing reservations survive exhaustion");
 
     reset_upload_chunk(chunks[0]);
-    check(chunks[0].used == 0 && chunks[0].unsubmitted_lists == 0 && chunks[0].submits.empty(),
-          "reset clears cursor, unsubmitted count and submits");
+    check(chunks[0].used == 0 && chunks[0].recordings == 0 && chunks[0].submits.empty(),
+          "reset clears cursor, recordings and submits");
     const auto recycled = reserve_upload_chunk(chunks[0], kAlign);
-    check(recycled.mapped == storage_a && recycled.offset == 0,
-          "recycled chunk reserves from start");
+    check(recycled.mapped == storage_a && recycled.offset == 0 && recycled.generation == 1,
+          "recycled chunk reserves from start with incremented generation");
 
-    // Guard fence logic and unsubmitted tracking:
+    // Guard fence logic, recording holds and device removal:
     struct MockFence {
         std::uint64_t completed = 0;
     };
@@ -80,12 +80,12 @@ int main()
         return reinterpret_cast<const MockFence*>(f)->completed;
     };
 
-    check(is_upload_chunk_idle(chunks[0], fence_query), "chunk without unsubmitted lists or submits is idle");
+    check(is_upload_chunk_idle(chunks[0], fence_query), "chunk without recordings or submits is idle");
 
-    chunks[0].unsubmitted_lists = 1;
-    check(!is_upload_chunk_idle(chunks[0], fence_query), "chunk with unsubmitted lists is not idle");
+    chunks[0].recordings = 1;
+    check(!is_upload_chunk_idle(chunks[0], fence_query), "closed list still held cannot be recycled");
 
-    chunks[0].unsubmitted_lists = 0;
+    chunks[0].recordings = 0;
     chunks[0].submits.emplace_back(reinterpret_cast<ID3D12Fence*>(&fence_a), 10);
     fence_a.completed = 9;
     check(!is_upload_chunk_idle(chunks[0], fence_query), "chunk with in-flight submit is not idle");
@@ -98,12 +98,15 @@ int main()
     fence_b.completed = 4;
     check(!is_upload_chunk_idle(chunks[0], fence_query), "chunk with second pending queue submit is not idle");
 
+    fence_b.completed = UINT64_MAX;
+    check(!is_upload_chunk_idle(chunks[0], fence_query), "device removal is not completion");
+
     fence_b.completed = 5;
     check(is_upload_chunk_idle(chunks[0], fence_query), "chunk with all queue submits completed is idle");
 
     reset_upload_chunk(chunks[0]);
-    check(chunks[0].used == 0 && chunks[0].unsubmitted_lists == 0 && chunks[0].submits.empty(),
-          "final reset clears submits");
+    check(chunks[0].used == 0 && chunks[0].recordings == 0 && chunks[0].submits.empty() && chunks[0].generation == 2,
+          "final reset clears submits and increments generation");
 
     std::puts("upload_reservation_check: all checks passed");
     return 0;

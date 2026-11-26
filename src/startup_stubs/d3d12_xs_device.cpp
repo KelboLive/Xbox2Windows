@@ -2440,7 +2440,6 @@ void note_upload_ring_submits(ID3D12Fence* fence, UINT64 value, const std::vecto
         for (std::size_t chunk_idx : it->second) {
             if (chunk_idx < upload_ring_chunks.size()) {
                 auto& chunk = upload_ring_chunks[chunk_idx];
-                if (chunk.unsubmitted_lists > 0) --chunk.unsubmitted_lists;
                 const auto sub = std::find_if(chunk.submits.begin(), chunk.submits.end(),
                     [fence](const auto& s) { return s.first == fence; });
                 if (sub != chunk.submits.end()) {
@@ -2450,7 +2449,6 @@ void note_upload_ring_submits(ID3D12Fence* fence, UINT64 value, const std::vecto
                 }
             }
         }
-        recorded_upload_chunks.erase(it);
     }
     ReleaseSRWLockExclusive(&upload_ring_lock);
 }
@@ -2464,7 +2462,7 @@ void discard_upload_ring(ID3D12CommandList* list)
         for (std::size_t chunk_idx : it->second) {
             if (chunk_idx < upload_ring_chunks.size()) {
                 auto& chunk = upload_ring_chunks[chunk_idx];
-                if (chunk.unsubmitted_lists > 0) --chunk.unsubmitted_lists;
+                if (chunk.recordings > 0) --chunk.recordings;
             }
         }
         recorded_upload_chunks.erase(it);
@@ -2481,12 +2479,27 @@ void note_upload_ring_use(ID3D12Resource* resource, ID3D12CommandList* list)
             auto& chunks = recorded_upload_chunks[list];
             if (std::find(chunks.begin(), chunks.end(), i) == chunks.end()) {
                 chunks.push_back(i);
-                ++upload_ring_chunks[i].unsubmitted_lists;
+                ++upload_ring_chunks[i].recordings;
             }
             break;
         }
     }
     ReleaseSRWLockExclusive(&upload_ring_lock);
+}
+
+bool is_upload_chunk_generation_valid(ID3D12Resource* resource, u64 generation)
+{
+    if (!resource) return false;
+    AcquireSRWLockShared(&upload_ring_lock);
+    for (const auto& chunk : upload_ring_chunks) {
+        if (chunk.resource == resource) {
+            const bool valid = chunk.generation == generation;
+            ReleaseSRWLockShared(&upload_ring_lock);
+            return valid;
+        }
+    }
+    ReleaseSRWLockShared(&upload_ring_lock);
+    return false;
 }
 
 static bool is_upload_chunk_idle(const UploadRingChunk& chunk)
@@ -2511,7 +2524,7 @@ UploadReservation reserve_upload_ring(std::size_t bytes, ID3D12CommandList* list
         auto& chunks = recorded_upload_chunks[list];
         if (std::find(chunks.begin(), chunks.end(), index) == chunks.end()) {
             chunks.push_back(index);
-            ++upload_ring_chunks[index].unsubmitted_lists;
+            ++upload_ring_chunks[index].recordings;
         }
     };
 
@@ -2625,7 +2638,7 @@ D3D12_GPU_VIRTUAL_ADDRESS upload_from_title(u64 title_address, std::size_t bytes
 {
     u64 offset = 0;
     ID3D12Resource* resource = nullptr;
-    return ring_copy(title_address, bytes, &offset, &resource) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
+    return ring_copy(title_address, bytes, &offset, &resource, list) && resource ? resource->GetGPUVirtualAddress() + offset : 0;
 }
 
 // Number of contiguous readable bytes at address, up to wanted.

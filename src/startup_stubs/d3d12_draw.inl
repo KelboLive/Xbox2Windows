@@ -1226,6 +1226,7 @@ struct FrameCopy {
     u64 address = 0;
     u64 offset = 0;
     ID3D12Resource* resource = nullptr;
+    u64 generation = 0;
     std::vector<unsigned char> content;
 };
 std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
@@ -1243,26 +1244,28 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset, ID3D12Resource** re
     const auto found = frame_copies().find(key);
     const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
     if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
-        *offset = found->second.offset;
-        if (resource) *resource = found->second.resource;
-        if (list && found->second.resource) note_upload_ring_use(found->second.resource, list);
-        return true;
+        if (is_upload_chunk_generation_valid(found->second.resource, found->second.generation)) {
+            *offset = found->second.offset;
+            if (resource) *resource = found->second.resource;
+            if (list && found->second.resource) note_upload_ring_use(found->second.resource, list);
+            return true;
+        }
     }
-    u64 fresh = 0;
-    ID3D12Resource* chunk = nullptr;
-    auto* ring = reserve_upload_ring(bytes, &fresh, &chunk, list);
-    if (!ring || !chunk) return false;
+    const auto reservation = reserve_upload_ring(bytes, list);
+    if (!reservation.mapped || !reservation.resource) return false;
+    const u64 fresh = reservation.offset;
+    auto* chunk = reservation.resource;
     // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
     const unsigned char* source = title;
     try {
         std::vector<unsigned char> content(title, title + bytes);
         // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
-        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, chunk, std::move(content)});
+        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, chunk, reservation.generation, std::move(content)});
         source = entry.first->second.content.data();
     } catch (const std::bad_alloc&) {
         // The ring slice is already reserved. The draw can proceed without another CPU allocation.
     }
-    std::memcpy(ring, source, bytes);
+    std::memcpy(reservation.mapped, source, bytes);
     if (known) {
         static LONG refreshed;
         if (first_calls(refreshed, 4))
