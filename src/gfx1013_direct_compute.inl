@@ -1245,6 +1245,35 @@ struct DirectCompute {
                                                       ir.binary("and", rounded, "65535")));
             return true;
         }
+        if (n == "v_min_f16" || n == "v_max_f16") {
+            if (i.subword || i.dpp_control || permuted || i.scale ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 4) || i.src[2])))
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            auto half_src = [&](unsigned j) {
+                auto bits = ir.binary("and", operand32(i, i.src[j]), "65535");
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto key = [&](const string &bits) {
+                auto neg_key = ir.binary("sub", "-1", ir.binary("and", bits, "32767"));
+                return select(cmp("ne", ir.binary("and", bits, "32768"), "0"), neg_key, bits);
+            };
+            auto a = half_src(0), b = half_src(1);
+            auto a_nan = cmp("ugt", ir.binary("and", a, "32767"), "31744");
+            auto b_nan = cmp("ugt", ir.binary("and", b, "32767"), "31744");
+            auto both_nan = ir.value("and i1 " + a_nan + ", " + b_nan);
+            auto ordered = select(cmp(n == "v_min_f16" ? "slt" : "sgt", key(a), key(b)), a, b);
+            auto result = select(both_nan, "32256", select(a_nan, b, select(b_nan, a, ordered)));
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         const auto rule = alu_rules.find(n);
         const bool byte_to_float =
             n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
