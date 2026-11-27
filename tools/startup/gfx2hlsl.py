@@ -9780,6 +9780,37 @@ class Stage:
     def op_v_dot8_u32_u4(self, ops, mods):
         return self.dot8_int('v_dot8_u32_u4', False, ops, mods)
 
+    def dot4_int(self, name, signed, ops, mods):
+        """VOP3P 4-byte integer dot product with 32-bit accumulate and optional saturating clamp."""
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands, expected 4' % (name, len(ops)))
+        if any(m != 'clamp' for m in mods):
+            raise Unsupported('%s with unsupported modifiers %s' % (name, mods))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2] or dst[1] > 255:
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        args = []
+        for tok in ops[1:4]:
+            if (tok.startswith('|') or tok.endswith('|') or tok.startswith(('abs(', 'neg('))
+                    or (tok.startswith('-') and not re.fullmatch(r'-\d+', tok))):
+                raise Unsupported('%s source modifier %s' % (name, tok))
+            sr = reg_range(tok)
+            if sr and (sr[1] != sr[2] or (sr[0] == 'v' and sr[1] > 255) or (sr[0] == 's' and sr[1] > 105)):
+                raise Unsupported('%s source %s' % (name, tok))
+            args.append(self.u(tok))
+        pipe = getattr(self, 'pipe', None)
+        if pipe is not None and isinstance(getattr(pipe, 'uses_dot4', None), set):
+            pipe.uses_dot4.add(name)
+        helper = 'dot4_i32_i8' if signed else 'dot4_u32_u8'
+        sat = 'true' if 'clamp' in mods else 'false'
+        self.set_v(dst[1], '%s(%s, %s, %s, %s)' % (helper, args[0], args[1], args[2], sat))
+
+    def op_v_dot4_i32_i8(self, ops, mods):
+        return self.dot4_int('v_dot4_i32_i8', True, ops, mods)
+
+    def op_v_dot4_u32_u8(self, ops, mods):
+        return self.dot4_int('v_dot4_u32_u8', False, ops, mods)
+
     def i64_words(self, tok, signed=False, literal=False):
         """(low, high) uint expressions of a 64-bit integer source: a VGPR/SGPR pair, an inline int or a
         32-bit hex literal when `literal` is set (zero-extended, sign-extended when the operation is signed)."""
@@ -11177,6 +11208,7 @@ class Pipeline:
     uses_lerp_u8 = False
     uses_perm_b32 = False
     uses_add_sub_sat_i32 = ()
+    uses_dot4 = ()
     uses_store_format_xyzw = False
     srv_formats = ()
     uavs = None  # key -> dict(index, kind): images a pixel stage stores to (u registers); None until the first store
@@ -11220,6 +11252,7 @@ class Pipeline:
         self.uses_lerp_u8 = False
         self.uses_perm_b32 = False
         self.uses_add_sub_sat_i32 = set()
+        self.uses_dot4 = set()
         self.uses_store_format_xyzw = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
@@ -11623,6 +11656,28 @@ class Pipeline:
                 '    }',
                 '}',
             ))
+        if 'v_dot4_u32_u8' in self.uses_dot4:
+            # RDNA 2 ISA V_DOT4_U32_U8: sum of 4 unsigned byte products + S2, optional uint32 clamp.
+            out.append(
+                'uint dot4_u32_u8(uint a, uint b, uint c, bool sat) {'
+                ' uint s = (a & 0xffu) * (b & 0xffu)'
+                ' + ((a >> 8u) & 0xffu) * ((b >> 8u) & 0xffu)'
+                ' + ((a >> 16u) & 0xffu) * ((b >> 16u) & 0xffu)'
+                ' + ((a >> 24u) & 0xffu) * ((b >> 24u) & 0xffu);'
+                ' uint r = c + s;'
+                ' return (sat && r < c) ? 0xffffffffu : r; }')
+        if 'v_dot4_i32_i8' in self.uses_dot4:
+            # RDNA 2 ISA V_DOT4_I32_I8: sum of 4 signed byte products + int(S2), optional int32 clamp.
+            out.append(
+                'uint dot4_i32_i8(uint a, uint b, uint c, bool sat) {'
+                ' int s = (asint((a & 0xffu) << 24u) >> 24) * (asint((b & 0xffu) << 24u) >> 24)'
+                ' + (asint(((a >> 8u) & 0xffu) << 24u) >> 24) * (asint(((b >> 8u) & 0xffu) << 24u) >> 24)'
+                ' + (asint(((a >> 16u) & 0xffu) << 24u) >> 24) * (asint(((b >> 16u) & 0xffu) << 24u) >> 24)'
+                ' + (asint(((a >> 24u) & 0xffu) << 24u) >> 24) * (asint(((b >> 24u) & 0xffu) << 24u) >> 24);'
+                ' uint r = c + asuint(s);'
+                ' if (sat && asint(c) > 0 && s > 0 && asint(r) < 0) return 0x7fffffffu;'
+                ' if (sat && asint(c) < 0 && s < 0 && asint(r) >= 0) return 0x80000000u;'
+                ' return r; }')
         if self.uses_lerp_u8:
             # RDNA 2 ISA V_LERP_U8: for each byte lane i, D_i = (S0_i + S1_i + (S2_i & 1)) >> 1.
             out.append(
@@ -11920,6 +11975,7 @@ class ComputePipeline(Pipeline):
         self.uses_lerp_u8 = False
         self.uses_perm_b32 = False
         self.uses_add_sub_sat_i32 = set()
+        self.uses_dot4 = set()
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
         self.notes, self.modified, self.other_modified = set(), set(), set()  # other: unproved descriptor writes
         self.lod_unvalidated = set()
