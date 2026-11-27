@@ -2904,10 +2904,14 @@ struct DirectCompute {
             auto row_base = ir.binary("and", lane, "4294967280");
             auto row_lane = ir.binary("and", lane, "15");
             auto amount = to_string(row.amount);
+            // DPP row_shl shifts data toward lower lane indices: lane N reads from N - amount.
+            // DPP row_shr shifts data toward higher lane indices: lane N reads from N + amount.
             const bool shl = row.op == Inst::DppRowOp::Shl;
-            auto peer = ir.binary(shl ? "add" : "sub", row_lane, amount);
-            if (row.op != Inst::DppRowOp::Ror)
-                source_usable = cmp("ult", peer, "16");
+            auto peer = ir.binary(shl ? "sub" : "add", row_lane, amount);
+            if (row.op != Inst::DppRowOp::Ror) {
+                // For row_shr: peer can exceed 15 → reject. For row_shl: peer can go negative → reject.
+                source_usable = shl ? cmp("uge", peer, "0") : cmp("ult", peer, "16");
+            }
             // Keep the physical lane index safe even when the shift is out of row.
             source_lane = ir.binary("or", row_base, ir.binary("and", peer, "15"));
         } else if (mask)
