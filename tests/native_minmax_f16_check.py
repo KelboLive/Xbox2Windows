@@ -1,4 +1,4 @@
-"""Direct compute v_min_f16 and v_max_f16 (VOP2 and VOP3A, exact integer ordering, high-half preserving)."""
+"""Direct compute v_min_f16 and v_max_f16 (VOP2, VOP3A, inline float constants, high-half preserving)."""
 from pathlib import Path
 import struct
 import subprocess
@@ -22,6 +22,18 @@ CASES = (
     (0x00007E01, 0x00007E02),  # qNaN vs qNaN -> 0x7E00 (clamped to 0)
 )
 
+# Inline float constants 240..247 (0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0) paired with VGPR b.
+INLINE_CASES = (
+    (240, 0x3800, 0x00000000),  # 0.5h vs +0.0h
+    (241, 0xB800, 0x00000000),  # -0.5h vs +0.0h
+    (242, 0x3C00, 0x00000000),  # 1.0h vs +0.0h (f32 low half would be 0!)
+    (243, 0xBC00, 0x00008000),  # -1.0h vs -0.0h
+    (244, 0x4000, 0x00003C00),  # 2.0h vs 1.0h
+    (245, 0xC000, 0x0000BC00),  # -2.0h vs -1.0h
+    (246, 0x4400, 0x00004000),  # 4.0h vs 2.0h
+    (247, 0xC400, 0x0000C000),  # -4.0h vs -2.0h
+)
+
 
 def v_mov_lit(vdst, lit):
     return [0x7E0002FF | ((vdst & 0xFF) << 17), lit & MASK]
@@ -38,20 +50,30 @@ def vop3_binary(op, vdst, src0, src1, *, abs_m=0, neg_m=0, clamp=0, omod=0, op_s
     return [w0, w1]
 
 
-def program():
+def program_main():
     code = [0xBE940304, 0xBE950380, 0xF408080A, 0xFA000020,
             0x8F078C05, 0x34100087, 0x4A101007, 0xBF8CC07F]
     for ci, (a, b) in enumerate(CASES):
         code += v_mov_lit(2, a) + v_mov_lit(3, b)
-        # 0: VOP2 v_min_f16 v4, v2, v3
         code += v_mov_lit(4, HIGH_SEED | 0x1111) + [vop2(0x3A, 4, 258, 3), 0xE0701000 | (4 * (ci * 4 + 0)), 0x80080408]
-        # 1: VOP2 v_max_f16 v4, v2, v3
         code += v_mov_lit(4, HIGH_SEED | 0x2222) + [vop2(0x39, 4, 258, 3), 0xE0701000 | (4 * (ci * 4 + 1)), 0x80080408]
-        # 2: VOP3A v_min_f16 v4, -v2, |v3|
         code += v_mov_lit(4, HIGH_SEED | 0x3333) + vop3_binary(0x13A, 4, 258, 259, neg_m=1, abs_m=2) + [
             0xE0701000 | (4 * (ci * 4 + 2)), 0x80080408]
-        # 3: VOP3A v_max_f16 v4, v2, v3 clamp
         code += v_mov_lit(4, HIGH_SEED | 0x4444) + vop3_binary(0x139, 4, 258, 259, clamp=1) + [
+            0xE0701000 | (4 * (ci * 4 + 3)), 0x80080408]
+    return code + [0xBF810000]
+
+
+def program_inline():
+    code = [0xBE940304, 0xBE950380, 0xF408080A, 0xFA000020,
+            0x8F078C05, 0x34100087, 0x4A101007, 0xBF8CC07F]
+    for ci, (src0, _f16, b) in enumerate(INLINE_CASES):
+        code += v_mov_lit(3, b)
+        code += v_mov_lit(4, HIGH_SEED | 0x1111) + [vop2(0x3A, 4, src0, 3), 0xE0701000 | (4 * (ci * 4 + 0)), 0x80080408]
+        code += v_mov_lit(4, HIGH_SEED | 0x2222) + [vop2(0x39, 4, src0, 3), 0xE0701000 | (4 * (ci * 4 + 1)), 0x80080408]
+        code += v_mov_lit(4, HIGH_SEED | 0x3333) + vop3_binary(0x13A, 4, src0, 259, abs_m=1) + [
+            0xE0701000 | (4 * (ci * 4 + 2)), 0x80080408]
+        code += v_mov_lit(4, HIGH_SEED | 0x4444) + vop3_binary(0x139, 4, src0, 259, clamp=1) + [
             0xE0701000 | (4 * (ci * 4 + 3)), 0x80080408]
     return code + [0xBF810000]
 
@@ -86,7 +108,7 @@ def minmax_f16(a, b, is_min, *, clamp=False, ignore_signed_zero=False, propagate
     return res & 0xFFFF
 
 
-def reference(*, ignore_signed_zero=False, propagate_nan=False, no_clamp=False, zero_high=False):
+def reference_main(*, ignore_signed_zero=False, propagate_nan=False, no_clamp=False, zero_high=False):
     hi = 0 if zero_high else HIGH_SEED
     words = [SENTINEL] * 8
     for _lane in range(64):
@@ -101,15 +123,35 @@ def reference(*, ignore_signed_zero=False, propagate_nan=False, no_clamp=False, 
     return words + [SENTINEL] * 8
 
 
+def reference_inline(*, inline_as_zero=False, zero_high=False):
+    hi = 0 if zero_high else HIGH_SEED
+    words = [SENTINEL] * 8
+    for _lane in range(64):
+        for _src0, f16, b in INLINE_CASES:
+            a = 0x0000 if inline_as_zero else f16
+            words.extend((
+                hi | minmax_f16(a, b, True),
+                hi | minmax_f16(a, b, False),
+                hi | minmax_f16(a & 0x7FFF, b, True),
+                hi | minmax_f16(a, b, False, clamp=True),
+            ))
+    return words + [SENTINEL] * 8
+
+
 def controls(cli, sdk, work, root):
-    marker = request(work, root, program())
-    output = marker.with_suffix('.cso')
-    result = subprocess.run([cli, sdk, work / 'cache', 'gfx1013-direct-cs@0', marker, output],
-                            capture_output=True, text=True)
-    assert result.returncode == 0 and output.is_file(), (result.stdout, result.stderr)
-    dump = subprocess.run([Path(sdk) / 'dxc.exe', '-dumpbin', output], capture_output=True,
-                          text=True, check=True).stdout
-    assert 'icmp slt i32 ' in dump and 'icmp sgt i32 ' in dump, dump
+    for tag, prog in (('main', program_main()), ('inline', program_inline())):
+        sub = work / tag
+        sub.mkdir(exist_ok=True)
+        marker = request(sub, root, prog)
+        output = marker.with_suffix('.cso')
+        result = subprocess.run([cli, sdk, work / 'cache', 'gfx1013-direct-cs@0', marker, output],
+                                capture_output=True, text=True)
+        assert result.returncode == 0 and output.is_file(), (tag, result.stdout, result.stderr)
+        dump = subprocess.run([Path(sdk) / 'dxc.exe', '-dumpbin', output], capture_output=True,
+                              text=True, check=True).stdout
+        assert 'icmp slt i32 ' in dump and 'icmp sgt i32 ' in dump, dump
+        if tag == 'inline':
+            assert '15360' in dump and '16384' in dump, 'inline f16 constants 1.0/2.0 must lower to 0x3c00/0x4000'
     for tag, bad, msg in (
         ('omod', vop3_binary(0x13A, 4, 258, 259, omod=1) + [0xBF810000], 'unsupported v_min_f16 operand modifiers'),
         ('op_sel', vop3_binary(0x139, 4, 258, 259, op_sel=1) + [0xBF810000], 'unsupported v_max_f16 operand modifiers'),
@@ -120,27 +162,31 @@ def controls(cli, sdk, work, root):
         bad_res = subprocess.run([cli, sdk, work / 'cache', 'gfx1013-direct-cs@0', bad_marker,
                                   bad_marker.with_suffix('.cso')], capture_output=True, text=True)
         assert bad_res.returncode != 0 and msg in (bad_res.stdout + bad_res.stderr), (tag, bad_res.stdout, bad_res.stderr)
-    assert reference() != reference(ignore_signed_zero=True)
-    assert reference() != reference(propagate_nan=True)
-    assert reference() != reference(no_clamp=True)
-    assert reference() != reference(zero_high=True)
-    print('v_min_f16/v_max_f16 DXIL verified; invalid modifiers refused; signed-zero, NaN, clamp and high-half controls differ')
+    assert reference_main() != reference_main(ignore_signed_zero=True)
+    assert reference_main() != reference_main(propagate_nan=True)
+    assert reference_main() != reference_main(no_clamp=True)
+    assert reference_main() != reference_main(zero_high=True)
+    assert reference_inline() != reference_inline(inline_as_zero=True)
+    print('v_min_f16/v_max_f16 DXIL verified; invalid modifiers refused; signed-zero, NaN, clamp, inline and high-half controls differ')
     return 0
 
 
 def hardware(replay, sdk, work, root):
-    marker = request(work, root, program())
-    output = work / 'out.bin'
-    result = subprocess.run([replay, sdk, marker, work / 'cache', '0', output, '--direct'])
-    if result.returncode == 77:
-        return 77
-    result.check_returncode()
-    expected = reference()
-    actual = struct.unpack(f'<{len(expected)}I', output.read_bytes())
-    mismatch = next((i for i, (a, e) in enumerate(zip(actual, expected)) if a != e), None)
-    if mismatch is not None:
-        raise AssertionError(f'word {mismatch}: got {actual[mismatch]:08x}, expected {expected[mismatch]:08x}')
-    print('v_min_f16/v_max_f16: 2048 result words (high halves kept) and 16 guards matched')
+    for tag, prog, expected in (('main', program_main(), reference_main()),
+                                ('inline', program_inline(), reference_inline())):
+        sub = work / f'hw_{tag}'
+        sub.mkdir(exist_ok=True)
+        marker = request(sub, root, prog)
+        output = work / f'out_{tag}.bin'
+        result = subprocess.run([replay, sdk, marker, work / 'cache', '0', output, '--direct'])
+        if result.returncode == 77:
+            return 77
+        result.check_returncode()
+        actual = struct.unpack(f'<{len(expected)}I', output.read_bytes())
+        mismatch = next((i for i, (a, e) in enumerate(zip(actual, expected)) if a != e), None)
+        if mismatch is not None:
+            raise AssertionError(f'{tag} word {mismatch}: got {actual[mismatch]:08x}, expected {expected[mismatch]:08x}')
+        print(f'{tag}: 2048 result words (high halves kept) and 16 guards matched')
     return 0
 
 
