@@ -392,7 +392,7 @@ def refusal_programs():
     programs.append(([0xb98005c1] + add + [0xbf810000], 'unsupported binary16 rounding or denormal mode'))
     programs.append(([0xbfa40001] + add + [0xbf810000], 'unsupported compute control instruction s_round_mode'))
     programs.append(([0xbfa5000c] + add + [0xbf810000], 'unsupported compute control instruction s_denorm_mode'))
-    programs.append((vop2(0x3a, 3, 257, 2) + [0xbf810000], 'direct DXIL lowering for v_min_f16'))
+    programs.append((vop1(0x60, 3, 257) + [0xbf810000], 'direct DXIL lowering for v_sin_f16'))
     for name, op in UNARY_CODE.items():
         programs.append((vop1(op, 3, 250) + [0, 0xbf810000], 'unsupported v_%s_f16 DPP form' % name))
         programs.append((vop3(op, 3, 257, 0, clamp=1, unary=True) + [0xbf810000],

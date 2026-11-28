@@ -36,6 +36,7 @@ param(
     [switch]$LazyMemory,                       # commit physical pages and large startup blocks on first touch (X2W_XMEM_LAZY_COMMIT, X2W_XMEM_LAZY_STARTUP, X2W_XMEM_SHARED_VIEWS)
     [switch]$TraceCalls,                       # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
     [double]$CaptureEvery = 0,                 # --capture-every: save the title window as window_<sss>s.png every N seconds (0 = off)
+    [ValidateSet(0, 1)] [int]$SuspendOthers = 1, # --suspend-others: 0 = don't hold other threads while a hook steps (faster, can miss traced calls)
     [switch]$TraceApi                          # log runtime provider method calls (X2W_TRACE_API)
 )
 $ErrorActionPreference = "Stop"
@@ -108,13 +109,15 @@ $mapArgs = @()
 if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 $captureArgs = @()
 if ($CaptureEvery -ne 0) { $captureArgs = @("--capture-every", "$CaptureEvery") }
+$holdArgs = @()
+if ($SuspendOthers -eq 0) { $holdArgs = @("--suspend-others", "0") }
 try {
     # Windows PowerShell 5.1 wraps redirected native stderr as an error record. Keep that
     # from aborting the launcher before it can report the debugger's exit code.
     & {
         $ErrorActionPreference = "Continue"
         & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs
+            --trace-files 1 --continue-asserts $ContinueAsserts --assert-sites $AssertSites @mapArgs @traceArgs @captureArgs @holdArgs
         $script:debuggerExit = $LASTEXITCODE
     } *> "$LogDir.out"
 } finally {

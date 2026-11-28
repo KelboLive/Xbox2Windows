@@ -1614,6 +1614,13 @@ keyed by thread id, not shared.
 Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
 console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` (`U`) counts the exposed step windows in which another thread could
 not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive (one exposed window can miss multiple calls). `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+The launchers pass it on: `run.ps1 -SuspendOthers 0`, `run.sh --suspend-others 0` (default 1 = hold).
+
+Holding has a cost in long title runs. A run opens tens of thousands of step windows with about 100 threads alive,
+most of them during the load after the first-run pages. On one host (RTX 3080 Ti, i7-4790K, Windows 10), with the same
+build and input script, holding cut the frame rate in that load from 18–23 to 3–5 fps and made it take 2–3 times as
+long (four runs with holding, three without). Use `-SuspendOthers 0` for frame-rate and load-time runs, and keep the
+default when `files.txt` or the offline socket refusals must be complete.
 
 `tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
 Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads

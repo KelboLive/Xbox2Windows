@@ -2281,6 +2281,39 @@ struct DirectCompute {
                                                       ir.binary("and", rounded, "65535")));
             return true;
         }
+        if (n == "v_min_f16" || n == "v_max_f16") {
+            if (graphics_input)
+                return false;
+            if (i.subword || i.dpp_control || permuted || i.scale ||
+                (i.wide && ((i.a & 0x7800) || ((i.abs | i.neg) & 4) || i.src[2])))
+                refuse(i.pc, "unsupported " + string(n) + " operand modifiers");
+            auto half_src = [&](unsigned j) {
+                const unsigned r = i.src[j];
+                auto inline_f = r >= 240 && r <= 248 ? packed_f16_inline_constant(r) : std::nullopt;
+                auto bits = inline_f ? to_string(*inline_f) : ir.binary("and", operand32(i, r), "65535");
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "32767");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "32768");
+                return bits;
+            };
+            auto key = [&](const string &bits) {
+                auto neg_key = ir.binary("sub", "-1", ir.binary("and", bits, "32767"));
+                return select(cmp("ne", ir.binary("and", bits, "32768"), "0"), neg_key, bits);
+            };
+            auto a = half_src(0), b = half_src(1);
+            auto a_nan = cmp("ugt", ir.binary("and", a, "32767"), "31744");
+            auto b_nan = cmp("ugt", ir.binary("and", b, "32767"), "31744");
+            auto both_nan = ir.value("and i1 " + a_nan + ", " + b_nan);
+            auto ordered = select(cmp(n == "v_min_f16" ? "slt" : "sgt", key(a), key(b)), a, b);
+            auto result = select(both_nan, "32256", select(a_nan, b, select(b_nan, a, ordered)));
+            if (i.clamp) {
+                auto nan = cmp("ugt", ir.binary("and", result, "32767"), "31744");
+                auto low = ir.value("or i1 " + nan + ", " + cmp("ne", ir.binary("and", result, "32768"), "0"));
+                result = select(low, "0", select(cmp("ugt", result, "15359"), "15360", result));
+            }
+            auto kept = ir.binary("and", read(i.dst), "4294901760");
+            vector_write(i.dst, ir.binary("or", kept, ir.binary("and", result, "65535")));
+            return true;
+        }
         if (n == "v_fma_f16" || n == "v_fmac_f16" || n == "v_fmamk_f16" || n == "v_fmaak_f16") {
             if (graphics_input)
                 return false;
@@ -3475,7 +3508,7 @@ struct DirectCompute {
             return;
         }
         if (compute && n == "s_bfm_b64") {
-            if ((i.dst & 1) || (i.dst > 104 && i.dst != 126))
+            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126))
                 refuse(i.pc, "invalid s_bfm_b64 destination");
             if ((i.src[0] > 105 && !constant32(i, i.src[0])) ||
                 (i.src[1] > 105 && !constant32(i, i.src[1])))
