@@ -174,6 +174,7 @@ bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* 
                 p.failed ? 1 : 0, static_cast<void*>(queue), static_cast<const void*>(steps), count, static_cast<const void*>(plane_surfaces));
         return false;
     }
+
     HWND window = output_window();
     if (!window) return false;
     if (!p.chain && !create_window_presenter(queue, window, plane_capacity)) {
@@ -201,8 +202,21 @@ bool present_to_window(ID3D12CommandQueue* queue, const x2w_startup::PlaneStep* 
     const HRESULT hr = p.chain->Present(0, 0);
     // The allocator is reused next frame: wait until this frame's commands are done.
     if (SUCCEEDED(queue->Signal(p.fence, ++p.fence_value)) && p.fence->GetCompletedValue() < p.fence_value &&
-        SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached)))
-        WaitForSingleObject(p.reached, 2000);
+        SUCCEEDED(p.fence->SetEventOnCompletion(p.fence_value, p.reached))) {
+        const DWORD wait = WaitForSingleObject(p.reached, 2000);
+        static LONG fence_log;
+        if (wait == WAIT_TIMEOUT) {
+            if (first_calls(fence_log, 4)) log("x2w-present fence wait TIMEOUT: value=%llu", p.fence_value);
+            p.failed = true;
+        } else if (wait != WAIT_OBJECT_0) {
+            static LONG fence_wait_fail_log;
+            if (first_calls(fence_wait_fail_log, 4)) log("x2w-present fence wait failed: %u", wait);
+            p.failed = true;
+        }
+    } else {
+        static LONG fence_signal_log;
+        if (first_calls(fence_signal_log, 4)) log("x2w-present fence signal/setEvent failed");
+    }
     static LONG failures;
     if (FAILED(hr) && first_calls(failures, 4)) log("x2w-present Present failed 0x%08lx", static_cast<unsigned long>(hr));
     check_device("window present", 0);
