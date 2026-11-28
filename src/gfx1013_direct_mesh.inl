@@ -524,7 +524,7 @@ NativeComputeShader lower_mesh(const string &code, const MeshStageLayout &layout
                     auto culled=alu.cmp("slt",packed,"0");
                     std::array<string,3> triangle;
                     for (unsigned c=0;c<3;++c) {
-                        triangle[c]=ir.binary("and",ir.binary("lshr",packed,to_string(10*c)),"1023");
+                        triangle[c]=ir.binary("and",ir.binary("lshr",packed,to_string(10*c)),"511");
                         culled=ir.value("or i1 "+culled+", "+alu.cmp("uge",triangle[c],to_string(vertices)));
                     }
                     ir.invoke("void","emitIndices",169,{{"i32",thread},{"i32",alu.select(culled,"0",triangle[0])},
