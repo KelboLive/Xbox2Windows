@@ -30,19 +30,19 @@ usage() {
     echo "       [--memory-gib 14] [--continue-asserts 0] [--assert-sites 0] [--input-script S] [--storage DIR]" >&2
     echo "       [--shader-cache out/startup/shader_cache] [--console 0|1] [--render] [--fake-user]" >&2
     echo "       [--gpu-mirror] [--host-cpu] [--translate] [--startup-below-40] [--trace-calls]" >&2
-    echo "       [--hide-title-window] [--capture-every S] [--fresh-shader-cache]" >&2
+    echo "       [--hide-title-window] [--capture-every S] [--fresh-shader-cache] [--suspend-others 0|1]" >&2
     exit 64
 }
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 here="$repo/tools/startup"
 exe="" data="" log="" seconds=120 build_dir=out/build/release memory_gib=14 continue_asserts=0 assert_sites=0
-input_script="" storage="" shader_cache=out/startup/shader_cache console=1 capture_every=0
+input_script="" storage="" shader_cache=out/startup/shader_cache console=1 capture_every=0 suspend_others=1
 render="" fake_user="" gpu_mirror="" host_cpu="" translate="" below_40="" trace_calls="" hide_title="" fresh_cache=""
 while [ $# -gt 0 ]; do
     case $1 in
         --exe|--data|--log|--seconds|--build-dir|--memory-gib|--continue-asserts|--assert-sites|--input-script|--storage|\
-        --shader-cache|--console|--capture-every)
+        --shader-cache|--console|--capture-every|--suspend-others)
             [ $# -ge 2 ] || usage
             case $1 in
                 --exe) exe=$2 ;; --data) data=$2 ;; --log) log=$2 ;; --seconds) seconds=$2 ;;
@@ -53,6 +53,7 @@ while [ $# -gt 0 ]; do
                 --storage) storage=$2 ;;                    # X2W_STORAGE_PATH: persistent local storage root
                 --shader-cache) shader_cache=$2 ;; --console) console=$2 ;;
                 --capture-every) capture_every=$2 ;;        # window_<sss>s.png every N seconds (0 = off)
+                --suspend-others) suspend_others=$2 ;;      # 0 = don't hold other threads while a hook steps
             esac
             shift 2 ;;
         --render) render=1; shift ;;              # draw through translated pipelines
@@ -69,6 +70,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$exe" ] && [ -n "$data" ] && [ -n "$log" ] || usage
+case $suspend_others in 0|1) ;; *) echo "run.sh: --suspend-others takes 0 or 1" >&2; exit 64 ;; esac
 [ -n "${WINEPREFIX:-}" ] || { echo "run.sh: set WINEPREFIX (docs/non-windows-hosts.md)" >&2; exit 64; }
 [ -n "${X2W_WIN_PYTHON:-}" ] || { echo "run.sh: set X2W_WIN_PYTHON to a Windows python.exe (docs/wine.md)" >&2; exit 64; }
 export WINEPREFIX
@@ -228,9 +230,11 @@ console_args=()
 [ "$console" = 1 ] || console_args=(--console "$console")
 capture_args=()
 [ "$capture_every" = 0 ] || capture_args=(--capture-every "$capture_every")
+hold_args=()
+[ "$suspend_others" = 1 ] || hold_args=(--suspend-others 0)
 "$wine" "$X2W_WIN_PYTHON" -B "$(win_path "$here/debug_launch.py")" "$(win_path "$exe")" "$(win_path "$data")" \
     "$(win_path "$log")" --timeout "$seconds" --memory-gib "$memory_gib" --trace-files 1 \
-    --continue-asserts "$continue_asserts" --assert-sites "$assert_sites" "${trace_args[@]}" "${console_args[@]}" "${capture_args[@]}" > "$log_host.out" 2>&1
+    --continue-asserts "$continue_asserts" --assert-sites "$assert_sites" "${trace_args[@]}" "${console_args[@]}" "${capture_args[@]}" "${hold_args[@]}" > "$log_host.out" 2>&1
 debugger_exit=$?
 if [ -n "$translate" ] && [ -n "$render" ] && [ -z "$revision_warned" ]; then check_cache_revision; fi
 head -n 5 "$log_host.out"
