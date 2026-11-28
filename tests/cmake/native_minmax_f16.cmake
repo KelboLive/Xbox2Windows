@@ -1,3 +1,9 @@
+if(TARGET native_compute_ir_dump AND EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME native_minmax_f16_ir
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_minmax_f16_check.py"
+            ir "$<TARGET_FILE:native_compute_ir_dump>")
+    set_tests_properties(native_minmax_f16_ir PROPERTIES TIMEOUT 60)
+endif()
 if(TARGET compile_dxil AND TARGET native_store_replay AND EXISTS "${INTAKE_PYTHON}")
     add_test(NAME native_minmax_f16_controls
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_minmax_f16_check.py"

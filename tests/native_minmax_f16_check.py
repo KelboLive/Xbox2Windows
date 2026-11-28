@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 from native_dpp_quad_check import request
+from native_f16_alu_check import dump as dump_ir, interpret as interpret_ir
 
 MASK = 0xFFFFFFFF
 SENTINEL = 0x69696969
@@ -22,7 +23,7 @@ CASES = (
     (0x00007E01, 0x00007E02),  # qNaN vs qNaN -> 0x7E00 (clamped to 0)
 )
 
-# Inline float constants 240..247 (0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0) paired with VGPR b.
+# All nine inline float constants 240..248 (0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2*pi)) paired with VGPR b.
 INLINE_CASES = (
     (240, 0x3800, 0x00000000),  # 0.5h vs +0.0h
     (241, 0xB800, 0x00000000),  # -0.5h vs +0.0h
@@ -32,6 +33,7 @@ INLINE_CASES = (
     (245, 0xC000, 0x0000BC00),  # -2.0h vs -1.0h
     (246, 0x4400, 0x00004000),  # 4.0h vs 2.0h
     (247, 0xC400, 0x0000C000),  # -4.0h vs -2.0h
+    (248, 0x3118, 0x00000000),  # 1/(2*pi)h (0x3118) vs +0.0h (f32 low half would be 0xf983, negative!)
 )
 
 
@@ -69,12 +71,10 @@ def program_inline():
             0x8F078C05, 0x34100087, 0x4A101007, 0xBF8CC07F]
     for ci, (src0, _f16, b) in enumerate(INLINE_CASES):
         code += v_mov_lit(3, b)
-        code += v_mov_lit(4, HIGH_SEED | 0x1111) + [vop2(0x3A, 4, src0, 3), 0xE0701000 | (4 * (ci * 4 + 0)), 0x80080408]
-        code += v_mov_lit(4, HIGH_SEED | 0x2222) + [vop2(0x39, 4, src0, 3), 0xE0701000 | (4 * (ci * 4 + 1)), 0x80080408]
-        code += v_mov_lit(4, HIGH_SEED | 0x3333) + vop3_binary(0x13A, 4, src0, 259, abs_m=1) + [
-            0xE0701000 | (4 * (ci * 4 + 2)), 0x80080408]
-        code += v_mov_lit(4, HIGH_SEED | 0x4444) + vop3_binary(0x139, 4, src0, 259, clamp=1) + [
-            0xE0701000 | (4 * (ci * 4 + 3)), 0x80080408]
+        code += v_mov_lit(4, HIGH_SEED | 0x1111) + [vop2(0x3A, 4, src0, 3), 0xE0701000 | (4 * (ci * 3 + 0)), 0x80080408]
+        code += v_mov_lit(4, HIGH_SEED | 0x2222) + [vop2(0x39, 4, src0, 3), 0xE0701000 | (4 * (ci * 3 + 1)), 0x80080408]
+        code += v_mov_lit(4, HIGH_SEED | 0x3333) + vop3_binary(0x13A, 4, src0, 259, abs_m=1, clamp=1) + [
+            0xE0701000 | (4 * (ci * 3 + 2)), 0x80080408]
     return code + [0xBF810000]
 
 
@@ -108,34 +108,69 @@ def minmax_f16(a, b, is_min, *, clamp=False, ignore_signed_zero=False, propagate
     return res & 0xFFFF
 
 
-def reference_main(*, ignore_signed_zero=False, propagate_nan=False, no_clamp=False, zero_high=False):
+def lane_results_main(*, ignore_signed_zero=False, propagate_nan=False, no_clamp=False, zero_high=False):
     hi = 0 if zero_high else HIGH_SEED
-    words = [SENTINEL] * 8
-    for _lane in range(64):
-        for a, b in CASES:
-            r_min = minmax_f16(a, b, True, ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
-            r_max = minmax_f16(a, b, False, ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
-            r_mod = minmax_f16((a & 0xFFFF) ^ 0x8000, b & 0x7FFF, True,
-                               ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
-            r_clamp = minmax_f16(a, b, False, clamp=not no_clamp,
-                                 ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
-            words.extend((hi | r_min, hi | r_max, hi | r_mod, hi | r_clamp))
-    return words + [SENTINEL] * 8
+    words = []
+    for a, b in CASES:
+        r_min = minmax_f16(a, b, True, ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
+        r_max = minmax_f16(a, b, False, ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
+        r_mod = minmax_f16((a & 0xFFFF) ^ 0x8000, b & 0x7FFF, True,
+                           ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
+        r_clamp = minmax_f16(a, b, False, clamp=not no_clamp,
+                             ignore_signed_zero=ignore_signed_zero, propagate_nan=propagate_nan)
+        words.extend((hi | r_min, hi | r_max, hi | r_mod, hi | r_clamp))
+    return words
 
 
-def reference_inline(*, inline_as_zero=False, zero_high=False):
+def lane_results_inline(*, inline_as_zero=False, zero_high=False):
     hi = 0 if zero_high else HIGH_SEED
-    words = [SENTINEL] * 8
-    for _lane in range(64):
-        for _src0, f16, b in INLINE_CASES:
-            a = 0x0000 if inline_as_zero else f16
-            words.extend((
-                hi | minmax_f16(a, b, True),
-                hi | minmax_f16(a, b, False),
-                hi | minmax_f16(a & 0x7FFF, b, True),
-                hi | minmax_f16(a, b, False, clamp=True),
-            ))
-    return words + [SENTINEL] * 8
+    words = []
+    for _src0, f16, b in INLINE_CASES:
+        a = 0x0000 if inline_as_zero else f16
+        words.extend((
+            hi | minmax_f16(a, b, True),
+            hi | minmax_f16(a, b, False),
+            hi | minmax_f16(a & 0x7FFF, b, True, clamp=True),
+        ))
+    return words
+
+
+def reference_main(**kwargs):
+    lane = lane_results_main(**kwargs)
+    return [SENTINEL] * 8 + lane * 64 + [SENTINEL] * 8
+
+
+def reference_inline(**kwargs):
+    lane = lane_results_inline(**kwargs) + [SENTINEL] * (32 - 3 * len(INLINE_CASES))
+    return [SENTINEL] * 8 + lane * 64 + [SENTINEL] * 8
+
+
+REFUSALS = (
+    ('omod', vop3_binary(0x13A, 4, 258, 259, omod=1) + [0xBF810000], 'unsupported v_min_f16 operand modifiers'),
+    ('op_sel', vop3_binary(0x139, 4, 258, 259, op_sel=1) + [0xBF810000], 'unsupported v_max_f16 operand modifiers'),
+)
+
+
+def run_ir(dumper):
+    with tempfile.TemporaryDirectory(prefix='x2w_native_minmax_f16_ir_') as temp:
+        work = Path(temp)
+        for tag, prog, expected in (('main', program_main(), lane_results_main()),
+                                    ('inline', program_inline(), lane_results_inline())):
+            run = dump_ir(dumper, work, prog, tag)
+            assert run.returncode == 0, (tag, run.stderr)
+            stores = sorted(interpret_ir(run.stdout))
+            assert [addr for addr, _ in stores] == [4 * i for i in range(len(expected))], (tag, stores[:4])
+            mismatch = next(((i, got, want) for i, ((_, got), want) in enumerate(zip(stores, expected)) if got != want),
+                            None)
+            if mismatch is not None:
+                i, got, want = mismatch
+                raise AssertionError(f'{tag} slot {i}: got {got:08x}, expected {want:08x}')
+        for tag, bad, msg in REFUSALS:
+            run = dump_ir(dumper, work, bad, f'refused_{tag}')
+            assert run.returncode != 0 and msg in (run.stdout + run.stderr), (tag, run.stdout, run.stderr)
+    print(f'native_minmax_f16 IR: {len(lane_results_main()) + len(lane_results_inline())} CPU-evaluated results '
+          f'(including all 9 inline float constants 240..248) match the model; {len(REFUSALS)} refusals verified')
+    return 0
 
 
 def controls(cli, sdk, work, root):
@@ -151,11 +186,10 @@ def controls(cli, sdk, work, root):
                               text=True, check=True).stdout
         assert 'icmp slt i32 ' in dump and 'icmp sgt i32 ' in dump, dump
         if tag == 'inline':
-            assert '15360' in dump and '16384' in dump, 'inline f16 constants 1.0/2.0 must lower to 0x3c00/0x4000'
-    for tag, bad, msg in (
-        ('omod', vop3_binary(0x13A, 4, 258, 259, omod=1) + [0xBF810000], 'unsupported v_min_f16 operand modifiers'),
-        ('op_sel', vop3_binary(0x139, 4, 258, 259, op_sel=1) + [0xBF810000], 'unsupported v_max_f16 operand modifiers'),
-    ):
+            # 0.5h (14336), 4.0h (17408), and 1/(2*pi)h (12568) appear only via inline-constant mapping.
+            assert '14336' in dump and '17408' in dump and '12568' in dump, (
+                'inline f16 constants 0.5/4.0/inv2pi must lower to 0x3800/0x4400/0x3118')
+    for tag, bad, msg in REFUSALS:
         sub = work / tag
         sub.mkdir(exist_ok=True)
         bad_marker = request(sub, root, bad)
@@ -186,11 +220,15 @@ def hardware(replay, sdk, work, root):
         mismatch = next((i for i, (a, e) in enumerate(zip(actual, expected)) if a != e), None)
         if mismatch is not None:
             raise AssertionError(f'{tag} word {mismatch}: got {actual[mismatch]:08x}, expected {expected[mismatch]:08x}')
-        print(f'{tag}: 2048 result words (high halves kept) and 16 guards matched')
+        print(f'{tag}: all {len(expected)} words (high halves and guards kept) matched')
     return 0
 
 
-def main(mode, executable, sdk):
+def main(args):
+    mode = args[0]
+    if mode == 'ir':
+        return run_ir(args[1])
+    executable, sdk = args[1], args[2]
     with tempfile.TemporaryDirectory(prefix='x2w_native_minmax_f16_') as temp:
         work = Path(temp)
         shader = work / 'root.hlsl'
@@ -201,4 +239,4 @@ def main(mode, executable, sdk):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(sys.argv[1], sys.argv[2], sys.argv[3]))
+    raise SystemExit(main(sys.argv[1:]))
