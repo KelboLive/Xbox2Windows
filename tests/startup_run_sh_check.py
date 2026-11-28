@@ -344,6 +344,11 @@ CASES = [
     dict(code=0, env_extra={"X2W_FAKE_USER": "1"}, expect_env={"X2W_FAKE_USER": "1"}),
     dict(code=0, switches=["--trace-calls", "--console", "0"], passed=["--trace-calls", "1", "--console", "0"]),
     dict(code=0, switches=["--capture-every", "5"], passed=["--capture-every", "5"]),
+    # --suspend-others 0 turns off the debugger's thread holding (#1408); 1 is its default and adds nothing.
+    dict(code=0, switches=["--suspend-others", "0"], passed=["--suspend-others", "0"]),
+    dict(code=0, switches=["--suspend-others", "1"]),
+    dict(code=0, switches=["--suspend-others", "2"], expect_exit=64,
+         expect_warnings=["run.sh: --suspend-others takes 0 or 1"]),
     # --data as a drive path stays as it is; its config is read through the prefix's dosdevices.
     # --storage is relative to the working directory, the scratch root, and gains a backslash.
     dict(code=7, drive_data=True,

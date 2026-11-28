@@ -17163,7 +17163,7 @@ Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and 
 
 ## Concurrent calls through a startup debugger hook
 
-The startup debugger holds every other thread while it steps one over a hooked function, so two threads entering the same hooked function are both traced ([#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281)). A run ends with `hook windows: ... unprotected=U`, the windows in which another thread could not be held or the 2 s deadline passed; `--suspend-others 0` turns the holding off. See [Concurrent calls through a hooked function](startup-runtime.md#concurrent-calls-through-a-hooked-function).
+The startup debugger holds every other thread while it steps one over a hooked function, so two threads entering the same hooked function are both traced ([#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281)). A run ends with `hook windows: ... unprotected=U`, the windows in which another thread could not be held or the 2 s deadline passed; `--suspend-others 0` (`run.ps1 -SuspendOthers 0`, `run.sh --suspend-others 0`) turns the holding off, which frame-rate and load-time runs need (holding cut the post-first-run load to 3–5 fps on one host). See [Concurrent calls through a hooked function](startup-runtime.md#concurrent-calls-through-a-hooked-function).
 
 ```powershell
 cmake --build --preset dev --target startup_launch_probe
