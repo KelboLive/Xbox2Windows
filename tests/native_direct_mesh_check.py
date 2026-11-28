@@ -98,6 +98,15 @@ def main():
         for marker in ('MeshOutputTopology=triangle','setMeshOutputCounts(i32 168, i32 3, i32 1)',
                        'storeVertexOutput.f32','emitIndices','flattenedThreadIdInGroup'):
             assert marker in text, marker
+        # The three primitive slots are 9-bit indices with the edge flag in
+        # bit 9. 0x20280600 encodes (0,1,2) with all three edge flags set.
+        edge = program.copy()
+        edge[14] = 0x20280600
+        text = run('edge-flags', edge)
+        assert 'and i32 %t22, 511' in text
+        assert 'and i32 %t26, 511' in text
+        assert 'and i32 %t30, 511' in text
+        assert '1023' not in text
         # A per-vertex raw PARAM0.xy must have the same semantic/channel
         # indices as the corresponding fixed PS reads.
         varying = program[:13] + [0xf8000203,0x00000201] + program[13:]
