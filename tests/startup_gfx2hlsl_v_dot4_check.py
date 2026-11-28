@@ -173,6 +173,9 @@ def run_controls():
           'uint dot4_u32_u8(' in ps_u and 'dot4_i32_i8' not in ps_u)
     check('dot4_i32_i8 emitted on demand and dot4_u32_u8 omitted',
           'uint dot4_i32_i8(' in ps_i and 'dot4_u32_u8' not in ps_i)
+    check('dot4_i32_i8 helper keeps both signed overflow sign guards',
+          'asint(c) > 0 && s > 0 && asint(r) < 0' in ps_i and
+          'asint(c) < 0 && s < 0 && asint(r) >= 0' in ps_i)
     zero = [(0, 0, 0)] * 4
     unused_ps = G.Pipeline(vs_words(zero), PRE_WORDS + POST_WORDS, root_blob()).hlsl_ps()
     check('both dot4 helpers omitted when unused', 'dot4_' not in unused_ps)
@@ -248,6 +251,12 @@ DRAW_CASES = (
         (0x80808080, 0x7f7f7f7f, 0x80000000),  # negative overflow -> saturates to 0x80000000
         (0x80808080, 0x7f7f7f7f, 0x3f800000),  # no overflow
         (0x01020304, 0x05060708, 0x3f800000),  # no overflow
+    ]),
+    ('v_dot4_i32_i8', 1, [
+        (0xfefdfcfb, 0x01020304, 0x00000001),  # c > 0, s < 0, r < 0: no overflow (-39)
+        (0x01020304, 0x05060708, 0xffffffff),  # c < 0, s > 0, r >= 0: no overflow (+69)
+        (0x7f7f7f7f, 0x7f7f7f7f, 0x7fff0000),  # close to INT32_MAX, no overflow
+        (0x80808080, 0x7f7f7f7f, 0xffff0000),  # negative + negative, no overflow
     ]),
 )
 
